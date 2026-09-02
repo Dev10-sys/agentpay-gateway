@@ -7,11 +7,20 @@ import io.dropwizard.setup.Bootstrap;
 import io.dropwizard.setup.Environment;
 import io.dropwizard.views.ViewBundle;
 
+import io.dropwizard.configuration.EnvironmentVariableSubstitutor;
+import io.dropwizard.configuration.SubstitutingSourceProvider;
+
 public class App extends Application<AppConfiguration> {
 
   @Override
   public void initialize(Bootstrap<AppConfiguration> bootstrap) {
     super.initialize(bootstrap);
+    bootstrap.setConfigurationSourceProvider(
+        new SubstitutingSourceProvider(
+            bootstrap.getConfigurationSourceProvider(),
+            new EnvironmentVariableSubstitutor(false)
+        )
+    );
     bootstrap.addBundle(new ViewBundle());
   }
 

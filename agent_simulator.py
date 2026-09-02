@@ -62,14 +62,14 @@ def phase_2_pay_via_checkout(order_id: str):
     step("PHASE 2 -- Pay via Razorpay Checkout (headless browser)")
 
     from playwright.sync_api import sync_playwright
-    import threading, http.server
+    import threading, http.server, os
 
     html_page = f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
-</head><body>
-<div id="result" style="padding:20px;font-family:monospace">Waiting...</div>
+</head><body style="background:#0f0f1a;margin:0">
+<div id="result" style="padding:20px;font-family:monospace;color:#aaa">Waiting for payment...</div>
 <script>
 window._paymentDone = undefined;
 var options = {{
@@ -77,12 +77,12 @@ var options = {{
     amount:      "100",
     currency:    "INR",
     name:        "AgentPay Gateway",
-    description: "AgentPay x402-INR resource unlock",
+    description: "AgentPay x402-INR: unlock {order_id}",
     order_id:    "{order_id}",
     prefill: {{
         name:    "Test Agent",
         email:   "agent@agentpay.dev",
-        contact: "+919999999999"
+        contact: "+918077907751"
     }},
     handler: function(response) {{
         document.getElementById('result').textContent = JSON.stringify(response);
@@ -100,7 +100,10 @@ var rzp = new Razorpay(options);
 rzp.open();
 </script></body></html>"""
 
-    srv_port = 19876
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        srv_port = s.getsockname()[1]
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -118,104 +121,143 @@ rzp.open();
     srv_thread.start()
 
     payment_proof = None
+    ss_dir = os.path.dirname(os.path.abspath(__file__))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=150,
+        browser = p.chromium.launch(headless=False, slow_mo=120,
                                     args=["--no-sandbox"])
-        ctx  = browser.new_context()
+        ctx  = browser.new_context(viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
 
-        page.goto(f"http://127.0.0.1:{srv_port}/checkout", wait_until="domcontentloaded")
-        page.wait_for_timeout(5000)
+        page.goto(f"http://127.0.0.1:{srv_port}/checkout",
+                  wait_until="domcontentloaded")
+        page.wait_for_timeout(6000)
 
-        # Log all frames to help debug selector mismatches
-        all_frames = page.frames
-        print(f"       Frames on page: {[f.url[:60] for f in all_frames]}")
+        # Dump all frames so we know exactly what Razorpay loaded
+        print(f"       Frames: {[f.url[:70] for f in page.frames]}")
 
-        # Razorpay Checkout iframe — try both URL patterns
-        iframe_sel = "iframe[src*='razorpay']"
-        print("       Waiting for Razorpay iframe...")
-        try:
-            page.wait_for_selector(iframe_sel, timeout=25000)
-            iframes = page.locator(iframe_sel).all()
-            print(f"       Found {len(iframes)} Razorpay iframe(s).")
-        except Exception as wf_err:
-            print(f"[WARN] Razorpay iframe wait: {wf_err}")
+        # --- Find the Razorpay checkout Frame object (not FrameLocator) ---
+        checkout_frame = None
+        deadline_find = time.time() + 20
+        while time.time() < deadline_find:
+            for f in page.frames:
+                if "razorpay" in f.url and "checkout" in f.url:
+                    checkout_frame = f
+                    break
+            if checkout_frame:
+                break
+            page.wait_for_timeout(500)
 
-        frame = page.frame_locator(iframe_sel).first
+        if not checkout_frame:
+            # fallback: any razorpay frame
+            for f in page.frames:
+                if "razorpay" in f.url:
+                    checkout_frame = f
+                    break
 
-        # Wait for something recognisable inside the iframe to be visible
-        # before trying to interact (modal may still be animating)
-        try:
-            frame.locator("body").wait_for(timeout=15000)
-            page.wait_for_timeout(2000)
-        except Exception:
-            pass
-
-        # --- UPI path (no OTP, instant in test mode) ---
-        try:
-            print("       Trying UPI flow (success@razorpay)...")
-            frame.get_by_text("UPI", exact=False).first.click(timeout=10000)
-            page.wait_for_timeout(1500)
-
-            upi_input = frame.locator(
-                "input[placeholder*='UPI'], "
-                "input[placeholder*='vpa'], "
-                "input[name*='vpa'], "
-                "input[id*='upi']"
-            ).first
-            upi_input.fill("success@razorpay", timeout=10000)
-            page.wait_for_timeout(800)
-
-            frame.get_by_role("button").filter(has_text="Pay").first.click(timeout=10000)
-            page.wait_for_timeout(8000)
-            print("       UPI payment submitted.")
-
-        except Exception as upi_err:
-            print(f"       UPI path failed: {str(upi_err)[:120]}")
-            print("       Falling back to test card 4111 1111 1111 1111...")
-
-            # --- Card fallback ---
+        if checkout_frame:
+            print(f"       Got checkout frame: {checkout_frame.url[:70]}")
             try:
-                frame.get_by_text("Card", exact=False).first.click(timeout=6000)
-                page.wait_for_timeout(1200)
+                checkout_frame.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(3000)
+
+            # Screenshot for evidence
+            ss_path = os.path.join(ss_dir, "simulator_checkout.png")
+            try:
+                page.screenshot(path=ss_path)
+                print(f"       Screenshot saved: {ss_path}")
             except Exception:
                 pass
 
+            # --- STEP 0: Dismiss "Contact details" overlay if present ---
             try:
-                frame.locator("input[name='card[number]']").fill(
-                    "4111111111111111", timeout=12000)
-                frame.locator("input[name='card[expiry]']").fill("12/26")
-                frame.locator("input[name='card[cvv]']").fill("123")
-                frame.get_by_role("button").filter(has_text="Pay").first.click(
-                    timeout=10000)
-                page.wait_for_timeout(5000)
+                checkout_frame.evaluate("""
+                    () => {
+                        function nativeSet(el, val) {
+                            var setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, val);
+                            el.dispatchEvent(new Event('input',  {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                        var allInputs = document.querySelectorAll('input');
+                        for (var inp of allInputs) {
+                            var ph = inp.placeholder || '';
+                            if (ph.toLowerCase().includes('mobile') || ph.toLowerCase().includes('phone')) {
+                                nativeSet(inp, '8077907751');
+                                break;
+                            }
+                        }
+                        var btns = document.querySelectorAll('button');
+                        for (var b of btns) {
+                            if (b.textContent.trim() === 'Continue') {
+                                b.click();
+                                return 'done';
+                            }
+                        }
+                        return 'no-overlay';
+                    }
+                """)
+                page.wait_for_timeout(2000)
+            except Exception:
+                pass
 
-                # 3DS OTP screen (Razorpay test mode sends to its own 3DS simulator)
-                try:
-                    page.wait_for_selector(
-                        "input[name='otp'], input[type='tel'], #otp-input",
-                        timeout=10000)
-                    page.locator(
-                        "input[name='otp'], input[type='tel'], #otp-input"
-                    ).first.fill("1234")
-                    page.locator("button[type='submit'], #otp-submit").first.click()
-                    page.wait_for_timeout(6000)
-                    print("       OTP submitted.")
-                except Exception:
-                    pass
-            except Exception as card_err:
-                print(f"[WARN] Card path failed: {str(card_err)[:120]}")
+            # --- STEP 1: Pay via Netbanking (Mock Bank Flow) ---
+            print("       Selecting Netbanking...")
+            try:
+                checkout_frame.get_by_text("Netbanking").first.click()
+                page.wait_for_timeout(1500)
+            except Exception as e:
+                print(f"       [WARN] Netbanking click: {e}")
+
+            # --- STEP 2: Click Test Bank and handle Mock Bank Popup ---
+            print("       Selecting Bank of Baroda...")
+            try:
+                checkout_frame.get_by_text("Bank of Baroda").first.click()
+                # Wait for mock bank popup to appear in browser context
+                bank_authorized = False
+                for _ in range(16):
+                    extra_pages = [p for p in ctx.pages if p != page]
+                    if extra_pages:
+                        bp = extra_pages[0]
+                        try:
+                            bp.wait_for_load_state("domcontentloaded", timeout=4000)
+                            bp.get_by_role("button", name="Success").click(timeout=4000)
+                            print("       Authorized payment on mock bank page (clicked Success).")
+                            bank_authorized = True
+                            page.wait_for_timeout(3000)
+                            break
+                        except Exception:
+                            pass
+                    page.wait_for_timeout(500)
+                if not bank_authorized:
+                    print("       [INFO] Waiting for payment callback...")
+            except Exception as bank_err:
+                print(f"       [WARN] Bank selection: {bank_err}")
+
+        else:
+            print("[WARN] Could not find Razorpay checkout frame.")
+
+
+        # Screenshot of final state
+        try:
+            ss2 = os.path.join(ss_dir, "simulator_final.png")
+            page.screenshot(path=ss2, full_page=False)
+            print(f"       Final screenshot: {ss2}")
+        except Exception:
+            pass
 
         # --- Poll for proof ---
-        print("       Polling for payment proof (up to 50 s)...")
+        print("       Polling for proof (up to 50 s)...")
         deadline = time.time() + 50
         while time.time() < deadline:
             result = page.evaluate("window._paymentDone")
             if result and result != "dismissed":
                 payment_proof = result
                 pid = result.get("razorpay_payment_id", "")
-                print(f"       Proof captured: payment_id={pid}...")
+                print(f"       Proof: payment_id={pid}")
                 break
             page.wait_for_timeout(1000)
 
@@ -224,7 +266,7 @@ rzp.open();
     httpd.shutdown()
 
     if not payment_proof:
-        print("[FAIL] Did not capture payment proof within the timeout window.")
+        print("[FAIL] No payment proof captured.")
         sys.exit(1)
 
     return payment_proof
@@ -296,7 +338,8 @@ def phase_5_meter_flow():
                 print(f"       Tick {ticks_done}: THRESHOLD CROSSED! Settlement order: {settlement_order_id}")
                 break
             elif body.get("status") == "settlement_pending":
-                print(f"       Tick {ticks_done}: Settlement still pending -> {body.get('pending_order_id')}")
+                settlement_order_id = body.get("pending_order_id")
+                print(f"       Tick {ticks_done}: Settlement pending order: {settlement_order_id}")
                 break
         else:
             print(f"[FAIL] Unexpected status {r.status_code}: {body}")

@@ -37,3 +37,7 @@ playwright-browsers/
 # IDE
 *.swp
 *.swo
+
+# Simulator screenshots
+simulator_*.png
+*.png

@@ -87,10 +87,10 @@ The simulator runs all five phases automatically:
 | Phase | What happens |
 |---|---|
 | 1 | `GET /agent/resource/market-data-v1` → **HTTP 402** with Razorpay order |
-| 2 | Playwright opens Checkout → pays via `success@razorpay` (UPI) or test card |
+| 2 | Playwright opens Checkout → selects Netbanking (test bank) → authorizes payment |
 | 3 | Same GET with proof headers → **HTTP 200** + unlocked resource |
 | 4 | Replay the same proof → **HTTP 409 Conflict** (graceful rejection) |
-| 5 | Tick metering (10 paise × 5 = 50 paise threshold) → settlement order → pay → ledger reset |
+| 5 | Tick metering (50 paise × 10 = 500 paise threshold) → settlement order → pay → ledger reset |
 
 ---
 
