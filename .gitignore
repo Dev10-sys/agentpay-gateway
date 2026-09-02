@@ -19,3 +19,21 @@
 # Maven
 log/
 target/
+
+# AgentPay SQLite database (contains agent state — never commit)
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Playwright browser cache
+playwright-browsers/
+
+# IDE
+*.swp
+*.swo

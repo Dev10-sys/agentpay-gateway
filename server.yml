@@ -1,2 +1,16 @@
-apiKey: 
-secretKey: 
+apiKey: ${RAZORPAY_KEY_ID}
+secretKey: ${RAZORPAY_SECRET}
+webhookSecret: ${RAZORPAY_WEBHOOK_SECRET}
+
+server:
+  applicationConnectors:
+    - type: http
+      port: 8080
+  adminConnectors:
+    - type: http
+      port: 8081
+
+logging:
+  level: INFO
+  appenders:
+    - type: console
