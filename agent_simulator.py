@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-agent_simulator.py — AgentPay x402-INR Gateway simulator.
+agent_simulator.py -- AgentPay x402-INR Gateway simulator.
 
 This script acts as an autonomous AI agent that:
-  1. Requests a protected resource (GET /agent/resource/{id}) — gets HTTP 402.
+  1. Requests a protected resource (GET /agent/resource/{id}) -- gets HTTP 402.
   2. Launches a headless Playwright browser to pay via Razorpay Checkout.
   3. Captures the three proof tokens returned by Checkout.
-  4. Retries the same GET with proof headers — gets HTTP 200 + unlocked resource.
+  4. Retries the same GET with proof headers -- gets HTTP 200 + unlocked resource.
   5. Deliberately replays the same proof to demonstrate graceful rejection.
   6. Runs the metering flow: ticks until threshold, settles, continues.
 
@@ -43,12 +43,12 @@ def check(response: requests.Response, expect_status: int, label: str):
         print(f"       Expected {expect_status}, got {response.status_code}")
         print(f"       Body: {response.text[:400]}")
         sys.exit(1)
-    print(f"[OK]   {label} → HTTP {response.status_code}")
+    print(f"[OK]   {label} -> HTTP {response.status_code}")
     return response.json()
 
 
 def phase_1_request_resource():
-    step("PHASE 1 — Request resource (expect 402 Payment Required)")
+    step("PHASE 1 -- Request resource (expect 402 Payment Required)")
     url = f"{SERVER}/agent/resource/{RESOURCE_ID}"
     r = requests.get(url, headers={"X-Agent-Id": AGENT_ID})
     body = check(r, 402, "GET /agent/resource without proof")
@@ -59,7 +59,7 @@ def phase_1_request_resource():
 
 
 def phase_2_pay_via_checkout(order_id: str):
-    step("PHASE 2 — Pay via Razorpay Checkout (headless browser)")
+    step("PHASE 2 -- Pay via Razorpay Checkout (headless browser)")
 
     from playwright.sync_api import sync_playwright
 
@@ -165,7 +165,7 @@ def phase_2_pay_via_checkout(order_id: str):
 
 
 def phase_3_retry_with_proof(proof: dict):
-    step("PHASE 3 — Retry resource request with proof headers (expect 200)")
+    step("PHASE 3 -- Retry resource request with proof headers (expect 200)")
     url = f"{SERVER}/agent/resource/{RESOURCE_ID}"
     headers = {
         "X-Agent-Id":            AGENT_ID,
@@ -178,12 +178,12 @@ def phase_3_retry_with_proof(proof: dict):
     print(f"       Resource unlocked!")
     resource = json.loads(body["resource"])
     for point in resource.get("data_points", []):
-        print(f"         • {point}")
+        print(f"         * {point}")
     return proof
 
 
 def phase_4_replay_attack(proof: dict):
-    step("PHASE 4 — Replay attack (duplicate proof, expect 409 Conflict)")
+    step("PHASE 4 -- Replay attack (duplicate proof, expect 409 Conflict)")
     url = f"{SERVER}/agent/resource/{RESOURCE_ID}"
     headers = {
         "X-Agent-Id":            AGENT_ID,
@@ -194,7 +194,7 @@ def phase_4_replay_attack(proof: dict):
     r = requests.get(url, headers=headers)
     if r.status_code == 409:
         body = r.json()
-        print(f"[OK]   Replay correctly rejected → HTTP 409")
+        print(f"[OK]   Replay correctly rejected -> HTTP 409")
         print(f"       Server says: {body.get('message')}")
     else:
         print(f"[FAIL] Expected 409 for replay attack, got {r.status_code}")
@@ -203,7 +203,7 @@ def phase_4_replay_attack(proof: dict):
 
 
 def phase_5_meter_flow():
-    step("PHASE 5 — Usage metering flow (tick → accumulate → threshold → settle)")
+    step("PHASE 5 -- Usage metering flow (tick -> accumulate -> threshold -> settle)")
 
     base_url = f"{SERVER}/agent/meter/{RESOURCE_ID}/tick"
     headers  = {
@@ -229,7 +229,7 @@ def phase_5_meter_flow():
                 print(f"       Tick {ticks_done}: THRESHOLD CROSSED! Settlement order: {settlement_order_id}")
                 break
             elif body.get("status") == "settlement_pending":
-                print(f"       Tick {ticks_done}: Settlement still pending → {body.get('pending_order_id')}")
+                print(f"       Tick {ticks_done}: Settlement still pending -> {body.get('pending_order_id')}")
                 break
         else:
             print(f"[FAIL] Unexpected status {r.status_code}: {body}")
@@ -260,7 +260,7 @@ def phase_5_meter_flow():
         print(f"[OK]   Meter settlement confirmed. Ledger reset to zero.")
         print(f"       Paid: {body.get('amount_paise')} paise")
     else:
-        print(f"[FAIL] Settlement confirmation failed: {r.status_code} → {body}")
+        print(f"[FAIL] Settlement confirmation failed: {r.status_code} -> {body}")
         sys.exit(1)
 
 
@@ -291,10 +291,10 @@ def main():
     # Phase 2: Pay via Razorpay Checkout (real browser automation)
     proof = phase_2_pay_via_checkout(order_id)
 
-    # Phase 3: Retry with proof — get the resource
+    # Phase 3: Retry with proof -- get the resource
     phase_3_retry_with_proof(proof)
 
-    # Phase 4: Replay the same proof — server must reject it
+    # Phase 4: Replay the same proof -- server must reject it
     phase_4_replay_attack(proof)
 
     # Phase 5: Usage metering demo
