@@ -62,141 +62,173 @@ def phase_2_pay_via_checkout(order_id: str):
     step("PHASE 2 -- Pay via Razorpay Checkout (headless browser)")
 
     from playwright.sync_api import sync_playwright
-    import threading, http.server, urllib.parse
+    import threading, http.server
 
-    html_page = f"""<!DOCTYPE html><html><head>
-    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
-    </head><body>
-    <div id="result"></div>
-    <script>
-    var options = {{
-        key: "{KEY_ID}",
-        amount: "100",
-        currency: "INR",
-        name: "AgentPay Gateway",
-        description: "AgentPay x402-INR resource unlock",
-        order_id: "{order_id}",
-        prefill: {{
-            name: "Test Agent",
-            email: "agent@agentpay.dev",
-            contact: "+919999999999"
-        }},
-        handler: function(response) {{
-            document.getElementById('result').textContent = JSON.stringify(response);
-            window._paymentDone = response;
-        }},
-        modal: {{
-            ondismiss: function() {{
-                window._paymentDone = null;
-                document.getElementById('result').textContent = 'dismissed';
-            }}
-        }},
-        theme: {{ color: "#6366f1" }}
-    }};
-    var rzp = new Razorpay(options);
-    rzp.open();
-    </script></body></html>"""
+    html_page = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head><body>
+<div id="result" style="padding:20px;font-family:monospace">Waiting...</div>
+<script>
+window._paymentDone = undefined;
+var options = {{
+    key:         "{KEY_ID}",
+    amount:      "100",
+    currency:    "INR",
+    name:        "AgentPay Gateway",
+    description: "AgentPay x402-INR resource unlock",
+    order_id:    "{order_id}",
+    prefill: {{
+        name:    "Test Agent",
+        email:   "agent@agentpay.dev",
+        contact: "+919999999999"
+    }},
+    handler: function(response) {{
+        document.getElementById('result').textContent = JSON.stringify(response);
+        window._paymentDone = response;
+    }},
+    modal: {{
+        ondismiss: function() {{
+            document.getElementById('result').textContent = 'dismissed';
+            window._paymentDone = 'dismissed';
+        }}
+    }},
+    theme: {{ color: "#6366f1" }}
+}};
+var rzp = new Razorpay(options);
+rzp.open();
+</script></body></html>"""
 
-    payment_proof = None
-    srv_port      = 19876
+    srv_port = 19876
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            body = html_page.encode()
+            body = html_page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type",   "text/html; charset=utf-8")
             self.send_header("Content-Length",  str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        def log_message(self, *a): pass
+        def log_message(self, *a):
+            pass
 
     httpd = http.server.HTTPServer(("127.0.0.1", srv_port), _Handler)
-    t = threading.Thread(target=httpd.handle_request, daemon=True)
-    t.start()
+    srv_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    srv_thread.start()
+
+    payment_proof = None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=200)
-        ctx     = browser.new_context()
-        page    = ctx.new_page()
+        browser = p.chromium.launch(headless=False, slow_mo=150,
+                                    args=["--no-sandbox"])
+        ctx  = browser.new_context()
+        page = ctx.new_page()
 
-        page.goto(f"http://127.0.0.1:{srv_port}/checkout")
-        page.wait_for_timeout(4000)
+        page.goto(f"http://127.0.0.1:{srv_port}/checkout", wait_until="domcontentloaded")
+        page.wait_for_timeout(5000)
 
-        print("       Waiting for Razorpay Checkout modal to open...")
+        # Log all frames to help debug selector mismatches
+        all_frames = page.frames
+        print(f"       Frames on page: {[f.url[:60] for f in all_frames]}")
+
+        # Razorpay Checkout iframe — try both URL patterns
+        iframe_sel = "iframe[src*='razorpay']"
+        print("       Waiting for Razorpay iframe...")
         try:
-            page.wait_for_selector("iframe[src*='checkout.razorpay']", timeout=20000)
-            print("       Checkout iframe detected.")
+            page.wait_for_selector(iframe_sel, timeout=25000)
+            iframes = page.locator(iframe_sel).all()
+            print(f"       Found {len(iframes)} Razorpay iframe(s).")
+        except Exception as wf_err:
+            print(f"[WARN] Razorpay iframe wait: {wf_err}")
+
+        frame = page.frame_locator(iframe_sel).first
+
+        # Wait for something recognisable inside the iframe to be visible
+        # before trying to interact (modal may still be animating)
+        try:
+            frame.locator("body").wait_for(timeout=15000)
+            page.wait_for_timeout(2000)
         except Exception:
-            print("[WARN] Checkout iframe not visible within 20 s; continuing anyway.")
+            pass
 
+        # --- UPI path (no OTP, instant in test mode) ---
         try:
-            frame = page.frame_locator("iframe[src*='checkout.razorpay']").first
+            print("       Trying UPI flow (success@razorpay)...")
+            frame.get_by_text("UPI", exact=False).first.click(timeout=10000)
+            page.wait_for_timeout(1500)
 
-            # UPI is fastest — no OTP required in test mode
+            upi_input = frame.locator(
+                "input[placeholder*='UPI'], "
+                "input[placeholder*='vpa'], "
+                "input[name*='vpa'], "
+                "input[id*='upi']"
+            ).first
+            upi_input.fill("success@razorpay", timeout=10000)
+            page.wait_for_timeout(800)
+
+            frame.get_by_role("button").filter(has_text="Pay").first.click(timeout=10000)
+            page.wait_for_timeout(8000)
+            print("       UPI payment submitted.")
+
+        except Exception as upi_err:
+            print(f"       UPI path failed: {str(upi_err)[:120]}")
+            print("       Falling back to test card 4111 1111 1111 1111...")
+
+            # --- Card fallback ---
             try:
-                print("       Trying UPI flow (success@razorpay)...")
-                frame.get_by_text("UPI", exact=False).first.click(timeout=8000)
-                page.wait_for_timeout(1500)
+                frame.get_by_text("Card", exact=False).first.click(timeout=6000)
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
 
-                upi_input = frame.locator(
-                    "input[placeholder*='Enter UPI'], "
-                    "input[placeholder*='UPI ID'], "
-                    "input[name*='vpa'], "
-                    "input[type='text']"
-                ).first
-                upi_input.fill("success@razorpay", timeout=8000)
-                page.wait_for_timeout(800)
-
-                pay_btn = frame.get_by_role("button", name="Pay").first
-                pay_btn.click(timeout=8000)
-                page.wait_for_timeout(6000)
-                print("       UPI payment submitted.")
-
-            except Exception as upi_err:
-                print(f"       UPI path skipped ({upi_err}); falling back to test card.")
-                try:
-                    frame.get_by_text("Card", exact=False).first.click(timeout=5000)
-                    page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-
-                frame.locator("input[name='card[number]']").fill("4111111111111111", timeout=10000)
+            try:
+                frame.locator("input[name='card[number]']").fill(
+                    "4111111111111111", timeout=12000)
                 frame.locator("input[name='card[expiry]']").fill("12/26")
                 frame.locator("input[name='card[cvv]']").fill("123")
-                frame.get_by_role("button", name="Pay").first.click()
-                page.wait_for_timeout(4000)
+                frame.get_by_role("button").filter(has_text="Pay").first.click(
+                    timeout=10000)
+                page.wait_for_timeout(5000)
 
-                # Handle 3DS / OTP redirect page
+                # 3DS OTP screen (Razorpay test mode sends to its own 3DS simulator)
                 try:
-                    page.wait_for_selector("input[name='otp'], input[type='tel']", timeout=8000)
-                    page.locator("input[name='otp'], input[type='tel']").first.fill("1234")
-                    page.locator("button[type='submit']").first.click()
-                    page.wait_for_timeout(5000)
+                    page.wait_for_selector(
+                        "input[name='otp'], input[type='tel'], #otp-input",
+                        timeout=10000)
+                    page.locator(
+                        "input[name='otp'], input[type='tel'], #otp-input"
+                    ).first.fill("1234")
+                    page.locator("button[type='submit'], #otp-submit").first.click()
+                    page.wait_for_timeout(6000)
+                    print("       OTP submitted.")
                 except Exception:
                     pass
+            except Exception as card_err:
+                print(f"[WARN] Card path failed: {str(card_err)[:120]}")
 
-        except Exception as e:
-            print(f"[WARN] Checkout interaction error: {e}")
-
-        print("       Polling for payment proof (up to 40 s)...")
-        deadline = time.time() + 40
+        # --- Poll for proof ---
+        print("       Polling for payment proof (up to 50 s)...")
+        deadline = time.time() + 50
         while time.time() < deadline:
             result = page.evaluate("window._paymentDone")
             if result and result != "dismissed":
                 payment_proof = result
                 pid = result.get("razorpay_payment_id", "")
-                print(f"       Proof captured: payment_id={pid[:24]}...")
+                print(f"       Proof captured: payment_id={pid}...")
                 break
             page.wait_for_timeout(1000)
 
         browser.close()
-        httpd.server_close()
+
+    httpd.shutdown()
 
     if not payment_proof:
         print("[FAIL] Did not capture payment proof within the timeout window.")
         sys.exit(1)
 
     return payment_proof
+
 
 
 def phase_3_retry_with_proof(proof: dict):
@@ -245,13 +277,13 @@ def phase_5_meter_flow():
         "X-Agent-Id":    AGENT_ID,
         "Content-Type":  "application/json",
     }
-    payload = {"tick_paise": 10, "threshold_paise": 50}
+    payload = {"tick_paise": 50, "threshold_paise": 500}
 
     settlement_order_id = None
     ticks_done = 0
 
-    print("       Ticking (10 paise each, threshold 50 paise)...")
-    for i in range(10):
+    print("       Ticking (50 paise each, threshold 500 paise)...")
+    for i in range(15):
         r = requests.post(base_url, headers=headers, json=payload)
         body = r.json()
         ticks_done += 1
