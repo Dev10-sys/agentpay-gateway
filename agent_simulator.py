@@ -25,6 +25,13 @@ import sys
 import time
 import requests
 
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 AGENT_ID   = "simulator-agent-001"
 RESOURCE_ID = "market-data-v1"
 SERVER      = "http://localhost:8080"
@@ -52,14 +59,16 @@ def phase_1_request_resource():
     url = f"{SERVER}/agent/resource/{RESOURCE_ID}"
     r = requests.get(url, headers={"X-Agent-Id": AGENT_ID})
     body = check(r, 402, "GET /agent/resource without proof")
+    amount = body.get('amount_paise', 0)
+    print(f"       Status   : HTTP 402 Payment Required")
     print(f"       Order ID : {body.get('razorpay_order_id')}")
-    print(f"       Amount   : {body.get('amount_paise')} paise")
+    print(f"       Amount   : INR {amount / 100:.2f} ({amount} paise)")
     print(f"       x402 hint: {body.get('instructions')}")
     return body["razorpay_order_id"]
 
 
 def phase_2_pay_via_checkout(order_id: str):
-    step("PHASE 2 -- Pay via Razorpay Checkout (headless browser)")
+    step("PHASE 2 -- Pay via Razorpay Checkout (automated browser)")
 
     from playwright.sync_api import sync_playwright
     import threading, http.server, os
@@ -124,22 +133,18 @@ rzp.open();
     ss_dir = os.path.dirname(os.path.abspath(__file__))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=120,
+        browser = p.chromium.launch(headless=False, slow_mo=80,
                                     args=["--no-sandbox"])
         ctx  = browser.new_context(viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
 
         page.goto(f"http://127.0.0.1:{srv_port}/checkout",
                   wait_until="domcontentloaded")
-        page.wait_for_timeout(6000)
+        page.wait_for_timeout(4000)
 
-        # Dump all frames so we know exactly what Razorpay loaded
-        print(f"       Frames: {[f.url[:70] for f in page.frames]}")
-
-        # --- Find the Razorpay checkout Frame object (not FrameLocator) ---
+        # Find Razorpay checkout frame
         checkout_frame = None
-        deadline_find = time.time() + 20
-        while time.time() < deadline_find:
+        for _ in range(30):
             for f in page.frames:
                 if "razorpay" in f.url and "checkout" in f.url:
                     checkout_frame = f
@@ -149,29 +154,20 @@ rzp.open();
             page.wait_for_timeout(500)
 
         if not checkout_frame:
-            # fallback: any razorpay frame
             for f in page.frames:
                 if "razorpay" in f.url:
                     checkout_frame = f
                     break
 
         if checkout_frame:
-            print(f"       Got checkout frame: {checkout_frame.url[:70]}")
+            print("       * Razorpay Checkout modal loaded.")
             try:
-                checkout_frame.wait_for_load_state("networkidle", timeout=15000)
+                checkout_frame.wait_for_load_state("networkidle", timeout=12000)
             except Exception:
                 pass
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(2000)
 
-            # Screenshot for evidence
-            ss_path = os.path.join(ss_dir, "simulator_checkout.png")
-            try:
-                page.screenshot(path=ss_path)
-                print(f"       Screenshot saved: {ss_path}")
-            except Exception:
-                pass
-
-            # --- STEP 0: Dismiss "Contact details" overlay if present ---
+            # Dismiss contact details overlay if shown
             try:
                 checkout_frame.evaluate("""
                     () => {
@@ -200,64 +196,54 @@ rzp.open();
                         return 'no-overlay';
                     }
                 """)
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(1500)
             except Exception:
                 pass
 
-            # --- STEP 1: Pay via Netbanking (Mock Bank Flow) ---
-            print("       Selecting Netbanking...")
+            # Step 1: Select Netbanking
             try:
                 checkout_frame.get_by_text("Netbanking").first.click()
                 page.wait_for_timeout(1500)
+                print("       * Payment method: Netbanking (domestic test rails)")
             except Exception as e:
-                print(f"       [WARN] Netbanking click: {e}")
+                print(f"       [WARN] Netbanking selection: {e}")
 
-            # --- STEP 2: Click Test Bank and handle Mock Bank Popup ---
-            print("       Selecting Bank of Baroda...")
+            # Step 2: Select test bank and authorize
             try:
                 checkout_frame.get_by_text("Bank of Baroda").first.click()
-                # Wait for mock bank popup to appear in browser context
+                print("       * Test bank: Bank of Baroda")
+                # Wait for mock bank popup window
                 bank_authorized = False
                 for _ in range(16):
-                    extra_pages = [p for p in ctx.pages if p != page]
+                    extra_pages = [pg for pg in ctx.pages if pg != page]
                     if extra_pages:
                         bp = extra_pages[0]
                         try:
                             bp.wait_for_load_state("domcontentloaded", timeout=4000)
                             bp.get_by_role("button", name="Success").click(timeout=4000)
-                            print("       Authorized payment on mock bank page (clicked Success).")
+                            print("       * Mock bank gateway: Payment authorized (Success clicked).")
                             bank_authorized = True
-                            page.wait_for_timeout(3000)
+                            page.wait_for_timeout(2500)
                             break
                         except Exception:
                             pass
                     page.wait_for_timeout(500)
                 if not bank_authorized:
-                    print("       [INFO] Waiting for payment callback...")
+                    print("       * Waiting for payment callback...")
             except Exception as bank_err:
-                print(f"       [WARN] Bank selection: {bank_err}")
+                print(f"       [WARN] Bank authorization: {bank_err}")
 
         else:
             print("[WARN] Could not find Razorpay checkout frame.")
 
-
-        # Screenshot of final state
-        try:
-            ss2 = os.path.join(ss_dir, "simulator_final.png")
-            page.screenshot(path=ss2, full_page=False)
-            print(f"       Final screenshot: {ss2}")
-        except Exception:
-            pass
-
-        # --- Poll for proof ---
-        print("       Polling for proof (up to 50 s)...")
-        deadline = time.time() + 50
+        # Poll for payment proof
+        deadline = time.time() + 45
         while time.time() < deadline:
             result = page.evaluate("window._paymentDone")
             if result and result != "dismissed":
                 payment_proof = result
                 pid = result.get("razorpay_payment_id", "")
-                print(f"       Proof: payment_id={pid}")
+                print(f"       * Cryptographic proof captured: payment_id={pid}")
                 break
             page.wait_for_timeout(1000)
 
@@ -272,7 +258,6 @@ rzp.open();
     return payment_proof
 
 
-
 def phase_3_retry_with_proof(proof: dict):
     step("PHASE 3 -- Retry resource request with proof headers (expect 200)")
     url = f"{SERVER}/agent/resource/{RESOURCE_ID}"
@@ -284,7 +269,7 @@ def phase_3_retry_with_proof(proof: dict):
     }
     r = requests.get(url, headers=headers)
     body = check(r, 200, "GET /agent/resource with valid proof")
-    print(f"       Resource unlocked!")
+    print("       Resource unlocked successfully!")
     resource = json.loads(body["resource"])
     for point in resource.get("data_points", []):
         print(f"         * {point}")
@@ -303,8 +288,8 @@ def phase_4_replay_attack(proof: dict):
     r = requests.get(url, headers=headers)
     if r.status_code == 409:
         body = r.json()
-        print(f"[OK]   Replay correctly rejected -> HTTP 409")
-        print(f"       Server says: {body.get('message')}")
+        print(f"[OK]   Replay attack rejected -> HTTP 409 Conflict")
+        print(f"       Security enforcement: {body.get('message')}")
     else:
         print(f"[FAIL] Expected 409 for replay attack, got {r.status_code}")
         print(f"       Body: {r.text[:300]}")
@@ -312,7 +297,7 @@ def phase_4_replay_attack(proof: dict):
 
 
 def phase_5_meter_flow():
-    step("PHASE 5 -- Usage metering flow (tick -> accumulate -> threshold -> settle)")
+    step("PHASE 5 -- Usage metering flow (micro-usage accumulation & settlement)")
 
     base_url = f"{SERVER}/agent/meter/{RESOURCE_ID}/tick"
     headers  = {
@@ -324,33 +309,35 @@ def phase_5_meter_flow():
     settlement_order_id = None
     ticks_done = 0
 
-    print("       Ticking (50 paise each, threshold 500 paise)...")
+    print("       Streaming micro-usage ticks (INR 0.50 each, settlement threshold INR 5.00)...")
     for i in range(15):
         r = requests.post(base_url, headers=headers, json=payload)
         body = r.json()
         ticks_done += 1
 
         if r.status_code == 200:
-            print(f"       Tick {ticks_done}: {body.get('accumulated_paise')} / {body.get('threshold_paise')} paise")
+            acc = body.get('accumulated_paise', 0)
+            thresh = body.get('threshold_paise', 500)
+            print(f"       Tick {ticks_done:2d}: INR {acc / 100:.2f} accumulated (threshold INR {thresh / 100:.2f})")
         elif r.status_code == 402:
             if body.get("status") == "settlement_required":
                 settlement_order_id = body.get("razorpay_order_id")
-                print(f"       Tick {ticks_done}: THRESHOLD CROSSED! Settlement order: {settlement_order_id}")
+                print(f"       Tick {ticks_done:2d}: THRESHOLD REACHED! Settlement order: {settlement_order_id}")
                 break
             elif body.get("status") == "settlement_pending":
                 settlement_order_id = body.get("pending_order_id")
-                print(f"       Tick {ticks_done}: Settlement pending order: {settlement_order_id}")
+                print(f"       Tick {ticks_done:2d}: Settlement pending order: {settlement_order_id}")
                 break
         else:
             print(f"[FAIL] Unexpected status {r.status_code}: {body}")
             sys.exit(1)
 
     if not settlement_order_id:
-        print("[INFO] No settlement order triggered in this run (may have already settled).")
+        print("[INFO] No settlement order triggered in this run (already settled).")
         return
 
-    print(f"\n       Settlement required for order: {settlement_order_id}")
-    print("       Launching Checkout to settle metered usage...")
+    print(f"\n       Settlement required: INR 5.00 for order {settlement_order_id}")
+    print("       Launching automated Checkout to settle metered usage...")
 
     proof = phase_2_pay_via_checkout(settlement_order_id)
 
@@ -367,8 +354,9 @@ def phase_5_meter_flow():
     )
     body = r.json()
     if r.status_code == 200 and body.get("status") == "settled":
+        amt = body.get('amount_paise', 0)
         print(f"[OK]   Meter settlement confirmed. Ledger reset to zero.")
-        print(f"       Paid: {body.get('amount_paise')} paise")
+        print(f"       Settled: INR {amt / 100:.2f} ({amt} paise)")
     else:
         print(f"[FAIL] Settlement confirmation failed: {r.status_code} -> {body}")
         sys.exit(1)
