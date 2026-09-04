@@ -91,18 +91,19 @@ public class AgentPolicyEngine {
     }
 
     // Called after payment is confirmed captured — converts reservation to actual spend inside an existing transaction.
-    public static void commitReservation(Connection conn, String agentId, long amountPaise) throws SQLException {
-        if (amountPaise <= 0) return;
+    public static boolean commitReservation(Connection conn, String agentId, long amountPaise) throws SQLException {
+        if (amountPaise <= 0) return false;
         try (PreparedStatement upd = conn.prepareStatement(
             "UPDATE agent_policy " +
             "SET daily_spent_paise=daily_spent_paise+?," +
             "    reserved_paise=MAX(0,reserved_paise-?) " +
-            "WHERE agent_id=?"
+            "WHERE agent_id=? AND reserved_paise >= ?"
         )) {
             upd.setLong(1, amountPaise);
             upd.setLong(2, amountPaise);
             upd.setString(3, agentId);
-            upd.executeUpdate();
+            upd.setLong(4, amountPaise);
+            return upd.executeUpdate() == 1;
         }
     }
 
@@ -113,7 +114,11 @@ public class AgentPolicyEngine {
             conn.setAutoCommit(false);
             beginImmediate(conn);
             try {
-                commitReservation(conn, agentId, amountPaise);
+                boolean ok = commitReservation(conn, agentId, amountPaise);
+                if (!ok) {
+                    rollback(conn);
+                    return new PolicyResult(false, "No active reservation matching amount.");
+                }
                 conn.commit();
                 return new PolicyResult(true, "Reservation committed.");
             } catch (SQLException e) {

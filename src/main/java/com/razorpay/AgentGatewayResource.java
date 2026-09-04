@@ -265,7 +265,13 @@ public class AgentGatewayResource {
                 }
 
                 // Move reserved → spent via canonical PolicyEngine method.
-                AgentPolicyEngine.commitReservation(conn, agentId, capturedPaise);
+                boolean committed = AgentPolicyEngine.commitReservation(conn, agentId, capturedPaise);
+                if (!committed) {
+                    conn.rollback();
+                    AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_DENIED,
+                            "Reservation amount mismatch during commit", orderId, paymentId);
+                    return err(409, "Active reservation mismatch. Settlement rejected.");
+                }
 
                 conn.commit();
 

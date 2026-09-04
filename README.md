@@ -95,8 +95,8 @@ playwright install chromium
 ### 4. Run the Autonomous AI Agent (Track 1)
 
 `ai_agent.py` acts as an autonomous economic buyer navigating the 402 payment protocol:
-- **Live LLM Engine**: Uses OpenAI (GPT-4o) or Google Gemini for dynamic tool planning, economic utility evaluation, and analytical synthesis when an API key is provided.
-- **Zero-Cost Heuristic Engine**: Runs offline with deterministic utility-scoring rules for reproducible tests and demonstrations.
+- **Live LLM Engine**: Uses an LLM-guided tool-use loop with OpenAI (default `gpt-4o-mini`, configurable via `--model`) or Google Gemini (default `gemini-1.5-flash`) for dynamic planning, economic utility evaluation, and analytical synthesis when an API key is provided.
+- **Zero-Cost Heuristic Engine**: Runs offline with deterministic utility-scoring rules for reproducible tests and demonstrations without external dependencies.
 
 ```powershell
 # Offline / Heuristic Mode

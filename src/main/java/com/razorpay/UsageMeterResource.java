@@ -237,22 +237,31 @@ public class UsageMeterResource {
         String status = (String) payment.get("status");
         if (!"captured".equals(status)) return err(402, "Payment not captured. Status: " + status);
 
+        // Verify payment is bound to the claimed order
+        String paymentOrderId = (String) payment.get("order_id");
+        if (!orderId.equals(paymentOrderId)) {
+            AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
+                    "order_id mismatch: proof=" + orderId + " payment=" + paymentOrderId, orderId, paymentId);
+            return err(400, "Payment order_id does not match supplied order_id.");
+        }
+
         int capturedPaise = (int) payment.get("amount");
 
-        // Validate order notes match this (agent, resource) — same binding as gateway.
+        // Validate order notes match this (agent, resource) — fail-closed
+        Order order;
         try {
-            Order order = client.Orders.fetch(orderId);
-            JSONObject notes = extractNotes(order);
-            String noteAgent    = notes.optString("agent_id",    "");
-            String noteResource = notes.optString("resource_id", "");
-            if (!agentId.equals(noteAgent) || !resourceId.equals(noteResource)) {
-                AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
-                        "Settlement order notes mismatch", orderId, paymentId);
-                return err(403, "Settlement order not bound to this agent/resource.");
-            }
+            order = client.Orders.fetch(orderId);
         } catch (RazorpayException e) {
-            // Non-fatal: order fetch is a defense-in-depth check; proceed if API is down.
-            System.err.println("[Meter] Orders.fetch warning: " + e.getMessage());
+            return err(502, "Orders.fetch failed: " + e.getMessage());
+        }
+
+        JSONObject notes = extractNotes(order);
+        String noteAgent    = notes.optString("agent_id",    "");
+        String noteResource = notes.optString("resource_id", "");
+        if (!agentId.equals(noteAgent) || !resourceId.equals(noteResource)) {
+            AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
+                    "Settlement order notes mismatch", orderId, paymentId);
+            return err(403, "Settlement order not bound to this agent/resource.");
         }
 
         try (Connection conn = AgentDatabase.getConnection()) {

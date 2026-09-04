@@ -186,6 +186,13 @@ public class AgentDatabase {
 
         try (Connection conn = getConnection()) {
             conn.setAutoCommit(false);
+            try (Statement st = conn.createStatement()) { st.execute("BEGIN IMMEDIATE"); }
+            catch (SQLException e) {
+                String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+                if (!msg.contains("cannot start a transaction within a transaction")) {
+                    System.err.println("[AgentDatabase] purge lock warning: " + e.getMessage());
+                }
+            }
 
             long totalRelease = 0;
             int count = 0;
