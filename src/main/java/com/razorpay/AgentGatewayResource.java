@@ -18,27 +18,29 @@ import java.sql.SQLException;
 /*
  * AgentPay x402-inspired machine-payment gateway.
  *
- * GET /agent/resource/{id}              no proof → 402 + Razorpay order
- * GET /agent/resource/{id}              with proof headers → verify → 200
- * POST /agent/resource/{id}/verify      JSON body equivalent (curl / Postman)
+ * GET /agent/resource/{id}            no proof → 402 + Razorpay order
+ * GET /agent/resource/{id}            with proof headers → verify → 200
+ * POST /agent/resource/{id}/verify    JSON body equivalent (curl / Postman)
  *
- * Security guarantees (Fixes #1 and #2):
+ * Security guarantees:
  *
- *   1. Budget is reserved at challenge time, not after payment. An agent
- *      cannot pay and then be denied because the daily cap was already full.
+ *   1. Budget reserved atomically before the Razorpay order is created.
+ *      An agent over its daily cap is denied before any payment is attempted.
+ *      Abandoned reservations are released automatically after 15 minutes.
  *
- *   2. Every 402 order is recorded in payment_challenge (order_id → agent +
+ *   2. Every 402 order is stored in payment_challenge (order_id → agent +
  *      resource + amount). Verification fetches the live Razorpay order and
- *      compares notes.agent_id, notes.resource_id, and amount against that
- *      local record. A valid payment proof for Resource A cannot unlock
- *      Resource B.
+ *      compares notes + amount against that record.
  *
- *   3. HMAC-SHA256 verified via Razorpay SDK before any DB state changes.
+ *   3. Challenge consumption is atomic: a single UPDATE WHERE status='PENDING'
+ *      runs inside the same BEGIN IMMEDIATE block as the reservation commit.
+ *      If two concurrent requests race on the same proof, only one UPDATE
+ *      affects a row; the other gets 0 rows → 409.
  *
- *   4. Payment status confirmed "captured" live from Razorpay API.
+ *   4. HMAC-SHA256 verified via Razorpay SDK.
  *
- *   5. Replay protection: payment_id can only appear once as VERIFIED in
- *      audit_log (partial unique index on razorpay_payment_id).
+ *   5. Replay protection: partial unique index on audit_log limits VERIFIED
+ *      rows to one per payment_id.
  */
 @Path("/agent")
 @Produces(MediaType.APPLICATION_JSON)
@@ -95,13 +97,10 @@ public class AgentGatewayResource {
 
     // ----- private ---------------------------------------------------------
 
-    /*
-     * Fix #1: Reserve budget before creating the Razorpay order.
-     * If the agent can't afford it, deny here — before any money changes hands.
-     * Store the challenge so verifyAndUnlock() can bind the proof to this
-     * exact (agent, resource, amount) tuple.
-     */
     private Response issueChallenge(String agentId, String resourceId) {
+        // Release any reservations from orders the agent never paid (15-min window).
+        AgentDatabase.purgeExpiredChallenges(agentId);
+
         AgentPolicyEngine.PolicyResult policy =
             AgentPolicyEngine.reserve(agentId, RESOURCE_PRICE_PAISE);
 
@@ -115,7 +114,7 @@ public class AgentGatewayResource {
             Order order = client.Orders.create(new JSONObject()
                 .put("amount",          RESOURCE_PRICE_PAISE)
                 .put("currency",        "INR")
-                .put("receipt",         "agentpay_" + resourceId + "_" + System.currentTimeMillis())
+                .put("receipt",         receipt("agp_", resourceId))
                 .put("payment_capture", 1)
                 .put("notes", new JSONObject()
                     .put("agent_id",    agentId)
@@ -125,7 +124,6 @@ public class AgentGatewayResource {
             razorpayOrderId = (String) order.get("id");
             int amountPaise = (int) order.get("amount");
 
-            // Persist the challenge so verification can bind proof to this request.
             insertChallenge(razorpayOrderId, agentId, resourceId, amountPaise);
 
             AuditLog.record(agentId, resourceId, amountPaise,
@@ -145,8 +143,8 @@ public class AgentGatewayResource {
                 .toString()).build();
 
         } catch (RazorpayException | SQLException e) {
-            // Release the reservation so the budget isn't permanently locked.
             if (razorpayOrderId == null) {
+                // Order was never created; safe to release the reservation.
                 AgentPolicyEngine.releaseReservation(agentId, RESOURCE_PRICE_PAISE);
             }
             AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_ERROR,
@@ -156,29 +154,25 @@ public class AgentGatewayResource {
     }
 
     /*
-     * Fix #2: Bind the proof to the exact challenge.
+     * Fix #2 (atomic replay guard):
+     *
+     * Challenge consumption and reservation commit happen inside ONE
+     * BEGIN IMMEDIATE transaction. Two concurrent requests with the same
+     * proof will both reach atomicConsumeChallenge(); only one UPDATE
+     * matches (status='PENDING'), the other gets 0 rows and returns 409.
      *
      * Verification order:
-     *   1. Replay check (audit_log unique index)
-     *   2. HMAC-SHA256 (Razorpay SDK)
-     *   3. payment.order_id matches the supplied order_id
-     *   4. Fetch live order from Razorpay; compare amount, currency, notes
-     *      (agent_id + resource_id) against the locally stored challenge
-     *   5. Payment status == "captured"
-     *   6. commitReservation (reserved → spent)
-     *   7. Mark challenge CONSUMED
+     *   1. HMAC-SHA256
+     *   2. payment.order_id == supplied order_id
+     *   3. Live order: amount, currency, notes (agent + resource)
+     *   4. Payment status == "captured"
+     *   5. BEGIN IMMEDIATE → atomicConsumeChallenge → commitReservation → COMMIT
+     *   6. Insert VERIFIED audit row
      */
     private Response verifyAndUnlock(String agentId, String resourceId,
                                      String paymentId, String orderId, String signature) {
 
-        // Step 1: Replay guard.
-        if (AuditLog.isAlreadyCredited(paymentId)) {
-            AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DUPLICATE,
-                    "Replay rejected", orderId, paymentId);
-            return err(409, "Payment " + paymentId + " already credited. Replay rejected.");
-        }
-
-        // Step 2: HMAC-SHA256.
+        // Step 1: HMAC-SHA256.
         boolean sigValid;
         try {
             sigValid = Utils.verifyPaymentSignature(new JSONObject()
@@ -193,7 +187,7 @@ public class AgentGatewayResource {
             return err(401, "Payment signature invalid.");
         }
 
-        // Step 3: Fetch payment; verify payment.order_id matches supplied orderId.
+        // Step 2: Fetch payment; verify payment.order_id == supplied orderId.
         Payment payment;
         try {
             payment = client.Payments.fetch(paymentId);
@@ -208,7 +202,7 @@ public class AgentGatewayResource {
             return err(400, "Payment order_id does not match supplied order_id.");
         }
 
-        // Step 4: Fetch live order; verify amount, currency, and agent/resource binding.
+        // Step 3: Fetch live order; verify amount, currency, and notes binding.
         Order order;
         try {
             order = client.Orders.fetch(orderId);
@@ -219,58 +213,27 @@ public class AgentGatewayResource {
         int    orderAmount   = (int) order.get("amount");
         String orderCurrency = (String) order.get("currency");
 
-        if (orderAmount != RESOURCE_PRICE_PAISE) {
-            AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
-                    "Amount mismatch: order=" + orderAmount + " expected=" + RESOURCE_PRICE_PAISE,
-                    orderId, paymentId);
-            return err(400, "Order amount does not match resource price.");
-        }
-        if (!"INR".equals(orderCurrency)) {
+        if (orderAmount != RESOURCE_PRICE_PAISE)
+            return err(400, "Order amount " + orderAmount + " != expected " + RESOURCE_PRICE_PAISE + " paise.");
+        if (!"INR".equals(orderCurrency))
             return err(400, "Order currency is not INR.");
-        }
 
-        // Verify notes: agent_id and resource_id must match this request.
-        JSONObject notes = new JSONObject();
-        try {
-            Object rawNotes = order.get("notes");
-            if (rawNotes instanceof JSONObject) notes = (JSONObject) rawNotes;
-            else notes = new JSONObject(rawNotes.toString());
-        } catch (Exception ignored) {}
-
+        JSONObject notes = extractNotes(order);
         String noteAgent    = notes.optString("agent_id",    "");
         String noteResource = notes.optString("resource_id", "");
 
         if (!agentId.equals(noteAgent)) {
             AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
-                    "agent_id mismatch: order.notes=" + noteAgent + " request=" + agentId,
-                    orderId, paymentId);
+                    "agent_id mismatch in order notes: " + noteAgent, orderId, paymentId);
             return err(403, "This order was not issued to agent: " + agentId);
         }
         if (!resourceId.equals(noteResource)) {
             AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
-                    "resource_id mismatch: order.notes=" + noteResource + " request=" + resourceId,
-                    orderId, paymentId);
+                    "resource_id mismatch in order notes: " + noteResource, orderId, paymentId);
             return err(403, "This order was not issued for resource: " + resourceId);
         }
 
-        // Confirm local challenge exists and is still PENDING.
-        try {
-            String challengeStatus = getChallengeStatus(orderId);
-            if (challengeStatus == null) {
-                AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
-                        "No local challenge found for order: " + orderId, orderId, paymentId);
-                return err(400, "No pending challenge found for this order.");
-            }
-            if (!"PENDING".equals(challengeStatus)) {
-                AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
-                        "Challenge already consumed: " + orderId, orderId, paymentId);
-                return err(409, "This order has already been consumed.");
-            }
-        } catch (SQLException e) {
-            return err(500, "Challenge lookup failed: " + e.getMessage());
-        }
-
-        // Step 5: Payment must be captured.
+        // Step 4: Payment must be captured.
         String status = (String) payment.get("status");
         if (!"captured".equals(status)) {
             AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
@@ -280,21 +243,48 @@ public class AgentGatewayResource {
 
         int capturedPaise = (int) payment.get("amount");
 
-        // Step 6: Convert reservation to actual spend.
-        AgentPolicyEngine.PolicyResult commit = AgentPolicyEngine.commitReservation(agentId, capturedPaise);
-        if (!commit.allowed) {
-            AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_ERROR,
-                    "commitReservation failed: " + commit.reason, orderId, paymentId);
-            return err(500, "Accounting error: " + commit.reason);
-        }
+        // Step 5: Atomic consume + commit inside one BEGIN IMMEDIATE transaction.
+        try (Connection conn = AgentDatabase.getConnection()) {
+            conn.setAutoCommit(false);
+            try (java.sql.Statement st = conn.createStatement()) {
+                st.execute("BEGIN IMMEDIATE");
+            }
+            try {
+                boolean consumed = AgentDatabase.atomicConsumeChallenge(conn, orderId);
+                if (!consumed) {
+                    conn.rollback();
+                    // Challenge missing or already consumed — replay or stale request.
+                    AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DUPLICATE,
+                            "Challenge not PENDING for order: " + orderId, orderId, paymentId);
+                    return err(409, "Order already consumed or not found. Replay rejected.");
+                }
 
-        // Step 7: Mark challenge consumed and write audit record.
-        try {
-            consumeChallenge(orderId);
+                // Move reserved → spent.
+                try (PreparedStatement upd = conn.prepareStatement(
+                    "UPDATE agent_policy " +
+                    "SET daily_spent_paise=daily_spent_paise+?," +
+                    "    reserved_paise=MAX(0,reserved_paise-?) " +
+                    "WHERE agent_id=?"
+                )) {
+                    upd.setLong(1, capturedPaise);
+                    upd.setLong(2, capturedPaise);
+                    upd.setString(3, agentId);
+                    upd.executeUpdate();
+                }
+
+                conn.commit();
+
+            } catch (SQLException e) {
+                try { conn.rollback(); } catch (SQLException ignored) {}
+                AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_ERROR,
+                        "Atomic commit failed: " + e.getMessage(), orderId, paymentId);
+                return err(500, "Accounting error: " + e.getMessage());
+            }
         } catch (SQLException e) {
-            System.err.println("[Gateway] consumeChallenge failed: " + e.getMessage());
+            return err(500, "DB connection error: " + e.getMessage());
         }
 
+        // Step 6: Durable VERIFIED record (replay protection index fires here if duplicate).
         AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_VERIFIED,
                 "Resource unlocked", orderId, paymentId);
 
@@ -325,29 +315,22 @@ public class AgentGatewayResource {
         }
     }
 
-    private String getChallengeStatus(String orderId) throws SQLException {
-        try (Connection conn = AgentDatabase.getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                 "SELECT status FROM payment_challenge WHERE order_id=?"
-             )) {
-            ps.setString(1, orderId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString("status") : null;
-            }
-        }
-    }
-
-    private void consumeChallenge(String orderId) throws SQLException {
-        try (Connection conn = AgentDatabase.getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                 "UPDATE payment_challenge SET status='CONSUMED' WHERE order_id=?"
-             )) {
-            ps.setString(1, orderId);
-            ps.executeUpdate();
-        }
-    }
-
     // ----- misc helpers ----------------------------------------------------
+
+    // Receipt must be <= 40 chars for Razorpay Orders API.
+    private String receipt(String prefix, String resourceId) {
+        long ts = System.currentTimeMillis() % 1_000_000_000L;
+        String base = prefix + (resourceId.length() > 20 ? resourceId.substring(0, 20) : resourceId);
+        return base + "_" + ts;
+    }
+
+    private JSONObject extractNotes(Order order) {
+        try {
+            Object raw = order.get("notes");
+            if (raw instanceof JSONObject) return (JSONObject) raw;
+            return new JSONObject(raw.toString());
+        } catch (Exception e) { return new JSONObject(); }
+    }
 
     private String buildResource(String resourceId) {
         return new JSONObject()

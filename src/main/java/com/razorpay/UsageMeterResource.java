@@ -18,29 +18,31 @@ import java.sql.SQLException;
 /*
  * Micro-usage metering for INR payments.
  *
- * Problem: Razorpay minimum order size makes per-call billing impractical.
- * Solution: ticks accumulate in a SQLite ledger per (agent, resource).
- *   When the running total crosses the threshold, one consolidated Razorpay
- *   order fires. Agent pays it, confirms with proof headers, ledger resets.
- *
  * POST /agent/meter/{resourceId}/tick
- *   Without proof  → record tick, or return 402 when threshold is crossed
- *   With proof      → validate + settle the pending order, reset ledger
+ *   Without proof  → record tick, return 402 when threshold crossed
+ *   With proof      → validate settlement proof, reset ledger
  *
- * Fix #3: captured amount must equal accumulated_paise before resetting.
+ * Budget model (Fix #8 — meter daily-cap bypass):
+ *   Each tick calls checkAndDebit(agentId, tickPaise) so the daily budget
+ *   shrinks immediately on usage, not only at settlement. An agent that
+ *   has used their full daily cap cannot accumulate further ticks even if
+ *   they haven't settled yet.
+ *
+ * Fix #3: captured amount must equal accumulated_paise before reset.
  * Fix #5: tick_paise and threshold_paise are validated server-side.
- *         Negative or zero values are rejected. Threshold minimum is 100 paise.
+ *
+ * Settlement additionally validates the Razorpay Order notes to confirm
+ * the payment was issued specifically for this (agent, resource) pair.
  */
 @Path("/agent/meter")
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class UsageMeterResource {
 
-    // Server-side defaults; clients may override only within validated bounds.
     static final long MIN_TICK_PAISE      = 1L;
-    static final long MAX_TICK_PAISE      = 100_00L;  // ₹100
+    static final long MAX_TICK_PAISE      = 100_00L;
     static final long MIN_THRESHOLD_PAISE = 100L;
-    static final long MAX_THRESHOLD_PAISE = 10_000_00L; // ₹10,000
+    static final long MAX_THRESHOLD_PAISE = 10_000_00L;
 
     private static final long DEFAULT_TICK      = 50L;
     private static final long DEFAULT_THRESHOLD = 500L;
@@ -69,7 +71,6 @@ public class UsageMeterResource {
 
         if (blank(agentId)) agentId = "anonymous-agent";
 
-        // Parse and validate client-supplied pricing overrides (Fix #5).
         long tickPaise = DEFAULT_TICK, thresholdPaise = DEFAULT_THRESHOLD;
         if (body != null && !body.trim().isEmpty()) {
             try {
@@ -79,7 +80,6 @@ public class UsageMeterResource {
             } catch (Exception ignored) {}
         }
 
-        // Bounds validation — reject nonsensical pricing from any caller.
         if (tickPaise < MIN_TICK_PAISE || tickPaise > MAX_TICK_PAISE)
             return err(400, "tick_paise must be between " + MIN_TICK_PAISE + " and " + MAX_TICK_PAISE + ".");
         if (thresholdPaise < MIN_THRESHOLD_PAISE || thresholdPaise > MAX_THRESHOLD_PAISE)
@@ -89,7 +89,7 @@ public class UsageMeterResource {
 
         boolean hasProof = !blank(paymentId) && !blank(orderId) && !blank(signature);
         return hasProof
-            ? confirmSettlement(agentId, resourceId, paymentId, orderId, signature, thresholdPaise)
+            ? confirmSettlement(agentId, resourceId, paymentId, orderId, signature)
             : processTick(agentId, resourceId, tickPaise, thresholdPaise);
     }
 
@@ -98,7 +98,8 @@ public class UsageMeterResource {
     private Response processTick(String agentId, String resourceId,
                                  long tickPaise, long thresholdPaise) {
 
-        AgentPolicyEngine.PolicyResult policy = AgentPolicyEngine.checkAndDebit(agentId, 0);
+        // Fix #8: debit the actual tick amount — accumulated usage counts toward daily cap.
+        AgentPolicyEngine.PolicyResult policy = AgentPolicyEngine.checkAndDebit(agentId, tickPaise);
         if (!policy.allowed) {
             AuditLog.record(agentId, resourceId, tickPaise, AuditLog.DECISION_DENIED,
                     "Policy denied: " + policy.reason, null, null);
@@ -132,8 +133,8 @@ public class UsageMeterResource {
                                 .put("pending_order_id",  pending)
                                 .put("accumulated_paise", acc)
                                 .put("message",
-                                    "Settle the pending order first. Retry with " +
-                                    "X-Razorpay-Payment-Id, X-Razorpay-Order-Id, X-Razorpay-Signature.")
+                                    "Settle the pending order first. " +
+                                    "Retry with X-Razorpay-Payment-Id, X-Razorpay-Order-Id, X-Razorpay-Signature.")
                                 .toString()).build();
                         }
 
@@ -200,11 +201,14 @@ public class UsageMeterResource {
 
     /*
      * Fix #3: reject settlement if captured amount != accumulated amount.
-     * This prevents a partial payment from resetting the full ledger.
+     * Settlement also validates Razorpay Order notes (agent_id, resource_id)
+     * for consistency with the gateway verification path.
+     *
+     * Note: daily budget was already debited tick-by-tick in processTick(),
+     * so we do NOT call checkAndDebit here — that would double-count.
      */
     private Response confirmSettlement(String agentId, String resourceId,
-                                       String paymentId, String orderId, String signature,
-                                       long thresholdPaise) {
+                                       String paymentId, String orderId, String signature) {
 
         if (AuditLog.isAlreadyCredited(paymentId))
             return err(409, "Payment " + paymentId + " already credited. Replay rejected.");
@@ -233,11 +237,27 @@ public class UsageMeterResource {
 
         int capturedPaise = (int) payment.get("amount");
 
+        // Validate order notes match this (agent, resource) — same binding as gateway.
+        try {
+            Order order = client.Orders.fetch(orderId);
+            JSONObject notes = extractNotes(order);
+            String noteAgent    = notes.optString("agent_id",    "");
+            String noteResource = notes.optString("resource_id", "");
+            if (!agentId.equals(noteAgent) || !resourceId.equals(noteResource)) {
+                AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
+                        "Settlement order notes mismatch", orderId, paymentId);
+                return err(403, "Settlement order not bound to this agent/resource.");
+            }
+        } catch (RazorpayException e) {
+            // Non-fatal: order fetch is a defense-in-depth check; proceed if API is down.
+            System.err.println("[Meter] Orders.fetch warning: " + e.getMessage());
+        }
+
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
             beginImmediate(conn);
             try {
-                long accumulated;
+                long   accumulated;
                 String pendingOrder;
 
                 try (PreparedStatement sel = conn.prepareStatement(
@@ -286,14 +306,7 @@ public class UsageMeterResource {
             return err(500, "DB error: " + e.getMessage());
         }
 
-        // Debit the daily budget for the settled amount.
-        AgentPolicyEngine.PolicyResult debit = AgentPolicyEngine.checkAndDebit(agentId, capturedPaise);
-        if (!debit.allowed) {
-            // Ledger is already reset at this point. Log the inconsistency but don't fail the response —
-            // the payment is real and captured. The daily cap for metering is advisory here.
-            System.err.println("[Meter] policy debit failed after settlement: " + debit.reason);
-        }
-
+        // Budget was already debited tick-by-tick; no second debit here.
         AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_VERIFIED,
                 "Meter settled. Ledger reset.", orderId, paymentId);
 
@@ -309,13 +322,28 @@ public class UsageMeterResource {
         Order order = client.Orders.create(new JSONObject()
             .put("amount",          amountPaise)
             .put("currency",        "INR")
-            .put("receipt",         "meter_" + resourceId + "_" + System.currentTimeMillis())
+            .put("receipt",         receipt("mtr_", resourceId))
             .put("payment_capture", 1)
             .put("notes", new JSONObject()
                 .put("agent_id",    agentId)
                 .put("resource_id", resourceId)
                 .put("type",        "usage_meter_settlement")));
         return (String) order.get("id");
+    }
+
+    // Receipt must be <= 40 chars for Razorpay Orders API.
+    private String receipt(String prefix, String resourceId) {
+        long ts = System.currentTimeMillis() % 1_000_000_000L;
+        String base = prefix + (resourceId.length() > 20 ? resourceId.substring(0, 20) : resourceId);
+        return base + "_" + ts;
+    }
+
+    private JSONObject extractNotes(Order order) {
+        try {
+            Object raw = order.get("notes");
+            if (raw instanceof JSONObject) return (JSONObject) raw;
+            return new JSONObject(raw.toString());
+        } catch (Exception e) { return new JSONObject(); }
     }
 
     private void ensureLedgerRow(Connection conn, String agentId, String resourceId,
@@ -332,9 +360,8 @@ public class UsageMeterResource {
         }
     }
 
-    private void beginImmediate(Connection conn) {
+    private void beginImmediate(Connection conn) throws SQLException {
         try (java.sql.Statement st = conn.createStatement()) { st.execute("BEGIN IMMEDIATE"); }
-        catch (SQLException ignored) {}
     }
 
     private void rollback(Connection conn) {

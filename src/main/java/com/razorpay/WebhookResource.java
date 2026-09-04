@@ -11,17 +11,16 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
 /*
- * Receives Razorpay webhook events (payment.captured, etc.).
+ * Receives Razorpay webhook events.
  *
- * IMPORTANT — webhook vs resource path isolation (Webhook fix):
- *   This handler does NOT write DECISION_VERIFIED to audit_log.
- *   VERIFIED is reserved exclusively for the resource/metering unlock path.
- *   If webhooks wrote VERIFIED, a race between webhook delivery and the
- *   agent's retry could cause isAlreadyCredited() to fire incorrectly
- *   and block the unlock with a spurious 409.
+ * Decision isolation: webhooks write DECISION_WEBHOOK — NOT DECISION_VERIFIED.
+ * isAlreadyCredited() only queries VERIFIED rows via the partial unique index,
+ * so webhook delivery never causes a spurious 409 on the agent retry path.
  *
- *   Webhook events are logged as DECISION_WEBHOOK — a distinct state that
- *   isAlreadyCredited() does not query.
+ * Idempotency: duplicate payment.captured deliveries are deduplicated via
+ * the payment_event table (UNIQUE on event_type + payment_id). Razorpay may
+ * deliver the same event more than once; this handler is safe to receive it
+ * multiple times.
  *
  * Setup:
  *   Set RAZORPAY_WEBHOOK_SECRET env var and register /webhook/razorpay
@@ -32,11 +31,9 @@ import javax.ws.rs.core.Response;
 @Consumes(MediaType.APPLICATION_JSON)
 public class WebhookResource {
 
-    private final String secretKey;
     private final String webhookSecret;
 
     public WebhookResource(String secretKey, String webhookSecret) {
-        this.secretKey     = secretKey;
         this.webhookSecret = webhookSecret;
     }
 
@@ -78,8 +75,17 @@ public class WebhookResource {
             return err(400, "Malformed payload: " + e.getMessage());
         }
 
-        // Log as WEBHOOK — NOT VERIFIED. The resource unlock path is the only
-        // place that writes VERIFIED, so isAlreadyCredited() won't false-positive.
+        // Deduplicate: returns false if this (event_type, payment_id) was already seen.
+        boolean isNew = AgentDatabase.recordWebhookEvent("payment.captured", paymentId, orderId);
+        if (!isNew) {
+            return Response.ok(new JSONObject()
+                .put("status",     "duplicate")
+                .put("payment_id", paymentId)
+                .put("message",    "Event already processed.")
+                .toString()).build();
+        }
+
+        // Log the event — DECISION_WEBHOOK keeps this row out of the replay-protection index.
         AuditLog.record("webhook", null, amount, AuditLog.DECISION_WEBHOOK,
                 "payment.captured received", orderId, null);
 

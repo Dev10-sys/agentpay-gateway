@@ -5,6 +5,8 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 
 import static org.junit.Assert.*;
 
@@ -122,4 +124,67 @@ public class AgentPolicyEngineTest {
         for (boolean r : results) if (r) wins++;
         assertEquals("Exactly one concurrent reservation should win when budget is exact", 1, wins);
     }
+
+    // ---- atomicConsumeChallenge -------------------------------------------
+
+    @Test
+    public void atomicConsumeChallenge_firstCall_returnsTrue() throws Exception {
+        // Insert a PENDING challenge manually.
+        try (Connection conn = AgentDatabase.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO payment_challenge(order_id,agent_id,resource_id,amount_paise,status) " +
+                 "VALUES('order_test1','agent-J','res-1',100,'PENDING')"
+             )) {
+            ps.executeUpdate();
+        }
+        try (Connection conn = AgentDatabase.getConnection()) {
+            assertTrue("First consume of PENDING challenge must succeed",
+                    AgentDatabase.atomicConsumeChallenge(conn, "order_test1"));
+        }
+    }
+
+    @Test
+    public void atomicConsumeChallenge_secondCall_returnsFalse() throws Exception {
+        try (Connection conn = AgentDatabase.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO payment_challenge(order_id,agent_id,resource_id,amount_paise,status) " +
+                 "VALUES('order_test2','agent-K','res-1',100,'PENDING')"
+             )) {
+            ps.executeUpdate();
+        }
+        try (Connection conn = AgentDatabase.getConnection()) {
+            AgentDatabase.atomicConsumeChallenge(conn, "order_test2"); // first consume
+        }
+        try (Connection conn = AgentDatabase.getConnection()) {
+            assertFalse("Second consume of already-CONSUMED challenge must return false",
+                    AgentDatabase.atomicConsumeChallenge(conn, "order_test2"));
+        }
+    }
+
+    // ---- purgeExpiredChallenges -------------------------------------------
+
+    @Test
+    public void purgeExpiredChallenges_releasesReservationForExpiredOrders() throws Exception {
+        // Reserve 200 paise, then inject a backdated PENDING challenge.
+        AgentPolicyEngine.upsertPolicy("agent-L", true, 200);
+        AgentPolicyEngine.reserve("agent-L", 200);
+
+        // Backdate the challenge to simulate expiry.
+        try (Connection conn = AgentDatabase.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO payment_challenge" +
+                 "(order_id,agent_id,resource_id,amount_paise,status,created_at) " +
+                 "VALUES('order_old','agent-L','res-1',200,'PENDING'," +
+                 "datetime('now','-20 minutes'))"
+             )) {
+            ps.executeUpdate();
+        }
+
+        AgentDatabase.purgeExpiredChallenges("agent-L");
+
+        // Budget should now be free again.
+        AgentPolicyEngine.PolicyResult r = AgentPolicyEngine.reserve("agent-L", 200);
+        assertTrue("After purge, agent should be able to reserve again", r.allowed);
+    }
 }
+
