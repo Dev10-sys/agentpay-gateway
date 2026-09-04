@@ -10,26 +10,15 @@ import javax.ws.rs.Produces;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
-/**
- * WebhookResource — receives and validates inbound Razorpay webhook events.
+/*
+ * Receives Razorpay webhook events.
  *
- * Razorpay sends a POST to this endpoint for every payment lifecycle event
- * (captured, failed, refunded, etc.).  The webhook signature header is
- * verified with the Razorpay SDK before any payload is processed.
+ * Verifies the X-Razorpay-Signature with HMAC-SHA256 before processing.
+ * Idempotent: duplicate payment.captured events are acknowledged but not
+ * re-processed (payment_id already present in audit_log as VERIFIED).
  *
- * Idempotency: events that reference a payment_id already present in
- * audit_log as VERIFIED are acknowledged but not re-processed.  This makes
- * the handler safe to receive Razorpay's duplicate delivery retries.
- *
- * Endpoint: POST /webhook/razorpay
- *
- * To enable webhooks:
- *   1. Set RAZORPAY_WEBHOOK_SECRET in the environment.
- *   2. Register https://your-host/webhook/razorpay in the Razorpay dashboard.
- *   3. Select the "payment.captured" event (minimum required by AgentPay).
- *
- * For local testing, use the Razorpay dashboard's "Test Webhook" button or
- * a tool like ngrok to expose the local server.
+ * Set RAZORPAY_WEBHOOK_SECRET and register /webhook/razorpay in the
+ * Razorpay dashboard to enable. Handled event: payment.captured.
  */
 @Path("/webhook")
 @Produces(MediaType.APPLICATION_JSON)
@@ -46,94 +35,67 @@ public class WebhookResource {
 
     @POST
     @Path("/razorpay")
-    public Response handleWebhook(
-            @HeaderParam("X-Razorpay-Signature") String webhookSig,
-            String body) {
-
-        // Webhook secret is optional in server.yml; return 503 if not configured
-        // rather than silently accepting unverified events.
-        if (webhookSecret == null || webhookSecret.trim().isEmpty()) {
-            return error(503, "Webhook secret not configured on this server.");
+    public Response handle(@HeaderParam("X-Razorpay-Signature") String sig, String body) {
+        if (webhookSecret == null || webhookSecret.isEmpty()) {
+            return err(503, "Webhook secret not configured.");
+        }
+        if (sig == null || sig.isEmpty()) {
+            return err(400, "Missing X-Razorpay-Signature.");
         }
 
-        if (webhookSig == null || webhookSig.trim().isEmpty()) {
-            return error(400, "Missing X-Razorpay-Signature header.");
-        }
-
-        boolean sigValid;
+        boolean valid;
         try {
-            sigValid = Utils.verifyWebhookSignature(body, webhookSig, webhookSecret);
+            valid = Utils.verifyWebhookSignature(body, sig, webhookSecret);
         } catch (RazorpayException e) {
-            return error(400, "Webhook signature verification error: " + e.getMessage());
+            return err(400, "Signature error: " + e.getMessage());
         }
-
-        if (!sigValid) {
-            return error(401, "Webhook signature invalid.");
-        }
+        if (!valid) return err(401, "Webhook signature invalid.");
 
         JSONObject event;
-        try {
-            event = new JSONObject(body);
-        } catch (Exception e) {
-            return error(400, "Webhook body is not valid JSON.");
-        }
+        try { event = new JSONObject(body); }
+        catch (Exception e) { return err(400, "Body is not valid JSON."); }
 
-        String eventType = event.optString("event", "");
+        String type = event.optString("event", "");
+        if ("payment.captured".equals(type)) return onPaymentCaptured(event);
 
-        if ("payment.captured".equals(eventType)) {
-            return handlePaymentCaptured(event);
-        }
-
-        // Unknown event types are acknowledged with 200 but not processed.
         return Response.ok(new JSONObject()
-                .put("status",  "ignored")
-                .put("event",   eventType)
-                .put("message", "Event type not handled by AgentPay.")
-                .toString()).build();
+            .put("status", "ignored").put("event", type).toString()).build();
     }
 
-    private Response handlePaymentCaptured(JSONObject event) {
-        String paymentId;
-        String orderId;
+    private Response onPaymentCaptured(JSONObject event) {
+        String paymentId, orderId;
         long   amount;
-
         try {
-            JSONObject payload = event.getJSONObject("payload");
-            JSONObject payment = payload.getJSONObject("payment").getJSONObject("entity");
-            paymentId = payment.getString("id");
-            orderId   = payment.optString("order_id", null);
-            amount    = payment.optLong("amount", 0);
+            JSONObject entity = event.getJSONObject("payload")
+                                     .getJSONObject("payment")
+                                     .getJSONObject("entity");
+            paymentId = entity.getString("id");
+            orderId   = entity.optString("order_id", null);
+            amount    = entity.optLong("amount", 0);
         } catch (Exception e) {
-            return error(400, "Malformed payment.captured payload: " + e.getMessage());
+            return err(400, "Malformed payload: " + e.getMessage());
         }
 
-        // Idempotency: acknowledge without re-processing.
         if (AuditLog.isAlreadyCredited(paymentId)) {
-            AuditLog.record("webhook", null, amount,
-                    AuditLog.DECISION_DUPLICATE,
-                    "Duplicate webhook – already credited",
-                    orderId, paymentId);
+            AuditLog.record("webhook", null, amount, AuditLog.DECISION_DUPLICATE,
+                    "Duplicate webhook", orderId, paymentId);
             return Response.ok(new JSONObject()
-                    .put("status",  "already_credited")
-                    .put("message", "Idempotency: payment already processed.")
-                    .toString()).build();
+                .put("status", "already_credited").toString()).build();
         }
 
-        AuditLog.record("webhook", null, amount,
-                AuditLog.DECISION_VERIFIED,
-                "Webhook payment.captured processed",
-                orderId, paymentId);
+        AuditLog.record("webhook", null, amount, AuditLog.DECISION_VERIFIED,
+                "payment.captured", orderId, paymentId);
 
         return Response.ok(new JSONObject()
-                .put("status",       "processed")
-                .put("payment_id",   paymentId)
-                .put("amount_paise", amount)
-                .toString()).build();
+            .put("status",       "processed")
+            .put("payment_id",   paymentId)
+            .put("amount_paise", amount)
+            .toString()).build();
     }
 
-    private Response error(int status, String message) {
+    private Response err(int status, String msg) {
         return Response.status(status)
-                .entity(new JSONObject().put("error", true).put("message", message).toString())
-                .build();
+            .entity(new JSONObject().put("error", true).put("message", msg).toString())
+            .build();
     }
 }
