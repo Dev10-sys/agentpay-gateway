@@ -245,14 +245,29 @@ public class UsageMeterResource {
             return err(400, "Payment order_id does not match supplied order_id.");
         }
 
-        int capturedPaise = (int) payment.get("amount");
+        int capturedPaise = ((Number) payment.get("amount")).intValue();
 
-        // Validate order notes match this (agent, resource) — fail-closed
+        // Validate order notes, currency, and amount match this (agent, resource, ledger balance) — fail-closed
         Order order;
         try {
             order = client.Orders.fetch(orderId);
         } catch (RazorpayException e) {
             return err(502, "Orders.fetch failed: " + e.getMessage());
+        }
+
+        int    orderAmount   = ((Number) order.get("amount")).intValue();
+        String orderCurrency = (String) order.get("currency");
+
+        if (!"INR".equalsIgnoreCase(orderCurrency)) {
+            AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
+                    "Settlement order currency is not INR: " + orderCurrency, orderId, paymentId);
+            return err(400, "Settlement order currency is not INR.");
+        }
+
+        if (capturedPaise != orderAmount) {
+            AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_DENIED,
+                    "Amount mismatch: captured=" + capturedPaise + " order=" + orderAmount, orderId, paymentId);
+            return err(400, "Captured payment amount (" + capturedPaise + " paise) does not match order amount (" + orderAmount + " paise).");
         }
 
         JSONObject notes = extractNotes(order);
@@ -289,15 +304,15 @@ public class UsageMeterResource {
                     return err(400, "Order ID mismatch. Expected: " + pendingOrder);
                 }
 
-                // Fix #3: captured must equal what we accumulated.
-                if (capturedPaise != accumulated) {
+                // Fix #3: captured and order amount must equal what we accumulated.
+                if (capturedPaise != accumulated || orderAmount != accumulated) {
                     conn.rollback();
                     AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_DENIED,
-                            "Amount mismatch: captured=" + capturedPaise + " expected=" + accumulated,
+                            "Amount mismatch: captured=" + capturedPaise + " order=" + orderAmount + " expected=" + accumulated,
                             orderId, paymentId);
                     return err(400, String.format(
-                        "Captured amount (%d paise) does not match accumulated balance (%d paise). " +
-                        "Ledger not reset.", capturedPaise, accumulated));
+                        "Captured amount (%d paise) or order amount (%d paise) does not match accumulated balance (%d paise). " +
+                        "Ledger not reset.", capturedPaise, orderAmount, accumulated));
                 }
 
                 try (PreparedStatement upd = conn.prepareStatement(

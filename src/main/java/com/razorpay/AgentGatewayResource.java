@@ -143,13 +143,13 @@ public class AgentGatewayResource {
                 .toString()).build();
 
         } catch (RazorpayException | SQLException e) {
-            if (razorpayOrderId == null) {
-                // Order was never created; safe to release the reservation.
-                AgentPolicyEngine.releaseReservation(agentId, RESOURCE_PRICE_PAISE);
-            }
+            // Fix: If Razorpay order creation fails OR local DB insertChallenge fails,
+            // the challenge is never delivered to the client (we return 502).
+            // Always release the reservation immediately to prevent orphan reservations.
+            AgentPolicyEngine.releaseReservation(agentId, RESOURCE_PRICE_PAISE);
             AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_ERROR,
-                    "Challenge issue failed: " + e.getMessage(), null, null);
-            return err(502, "Order creation failed: " + e.getMessage());
+                    "Challenge issue failed: " + e.getMessage(), razorpayOrderId, null);
+            return err(502, "Challenge issue failed: " + e.getMessage());
         }
     }
 
@@ -312,7 +312,10 @@ public class AgentGatewayResource {
             ps.setString(2, agentId);
             ps.setString(3, resourceId);
             ps.setLong(4, amountPaise);
-            ps.executeUpdate();
+            int rows = ps.executeUpdate();
+            if (rows == 0) {
+                throw new SQLException("Failed to insert challenge row for order: " + orderId);
+            }
         }
     }
 
