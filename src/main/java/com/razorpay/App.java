@@ -39,6 +39,7 @@ public class App extends Application<AppConfiguration> {
 
         System.out.println("[AgentPay] key=" + apiKey);
 
+        AgentDatabase.setDbPath(cfg.getDbPath());
         AgentDatabase.initialize();
 
         env.jersey().register(new PaymentResource(apiKey, secretKey));

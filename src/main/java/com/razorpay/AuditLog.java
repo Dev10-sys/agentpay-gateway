@@ -18,6 +18,9 @@ public class AuditLog {
     public static final String DECISION_VERIFIED  = "VERIFIED";
     public static final String DECISION_DUPLICATE = "DUPLICATE";
     public static final String DECISION_ERROR     = "ERROR";
+    // Webhook delivery acknowledgement — distinct from VERIFIED so
+    // isAlreadyCredited() never returns true on a webhook-only event.
+    public static final String DECISION_WEBHOOK   = "WEBHOOK";
 
     // Failures are swallowed so a broken audit write never kills the payment flow.
     public static void record(String agentId, String resourceId, long amountPaise,

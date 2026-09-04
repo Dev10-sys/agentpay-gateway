@@ -12,13 +12,14 @@ WORKDIR /app
 
 COPY --from=builder /build/target/razorpay-java-testapp-1.0-SNAPSHOT.jar app.jar
 
-ENV RAZORPAY_API_KEY=""
-ENV RAZORPAY_SECRET_KEY=""
+# Env var names match server.yml placeholders exactly.
+ENV RAZORPAY_KEY_ID=""
+ENV RAZORPAY_SECRET=""
 ENV RAZORPAY_WEBHOOK_SECRET=""
 
 RUN cat > server.yml << 'EOF'
-apiKey: ${RAZORPAY_API_KEY}
-secretKey: ${RAZORPAY_SECRET_KEY}
+apiKey: ${RAZORPAY_KEY_ID}
+secretKey: ${RAZORPAY_SECRET}
 webhookSecret: ${RAZORPAY_WEBHOOK_SECRET}
 
 server:

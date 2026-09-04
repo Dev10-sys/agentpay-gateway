@@ -11,14 +11,21 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
 /*
- * Receives Razorpay webhook events.
+ * Receives Razorpay webhook events (payment.captured, etc.).
  *
- * Verifies the X-Razorpay-Signature with HMAC-SHA256 before processing.
- * Idempotent: duplicate payment.captured events are acknowledged but not
- * re-processed (payment_id already present in audit_log as VERIFIED).
+ * IMPORTANT — webhook vs resource path isolation (Webhook fix):
+ *   This handler does NOT write DECISION_VERIFIED to audit_log.
+ *   VERIFIED is reserved exclusively for the resource/metering unlock path.
+ *   If webhooks wrote VERIFIED, a race between webhook delivery and the
+ *   agent's retry could cause isAlreadyCredited() to fire incorrectly
+ *   and block the unlock with a spurious 409.
  *
- * Set RAZORPAY_WEBHOOK_SECRET and register /webhook/razorpay in the
- * Razorpay dashboard to enable. Handled event: payment.captured.
+ *   Webhook events are logged as DECISION_WEBHOOK — a distinct state that
+ *   isAlreadyCredited() does not query.
+ *
+ * Setup:
+ *   Set RAZORPAY_WEBHOOK_SECRET env var and register /webhook/razorpay
+ *   in the Razorpay dashboard. Handled event: payment.captured.
  */
 @Path("/webhook")
 @Produces(MediaType.APPLICATION_JSON)
@@ -36,19 +43,14 @@ public class WebhookResource {
     @POST
     @Path("/razorpay")
     public Response handle(@HeaderParam("X-Razorpay-Signature") String sig, String body) {
-        if (webhookSecret == null || webhookSecret.isEmpty()) {
+        if (webhookSecret == null || webhookSecret.isEmpty())
             return err(503, "Webhook secret not configured.");
-        }
-        if (sig == null || sig.isEmpty()) {
+        if (sig == null || sig.isEmpty())
             return err(400, "Missing X-Razorpay-Signature.");
-        }
 
         boolean valid;
-        try {
-            valid = Utils.verifyWebhookSignature(body, sig, webhookSecret);
-        } catch (RazorpayException e) {
-            return err(400, "Signature error: " + e.getMessage());
-        }
+        try { valid = Utils.verifyWebhookSignature(body, sig, webhookSecret); }
+        catch (RazorpayException e) { return err(400, "Signature error: " + e.getMessage()); }
         if (!valid) return err(401, "Webhook signature invalid.");
 
         JSONObject event;
@@ -76,18 +78,13 @@ public class WebhookResource {
             return err(400, "Malformed payload: " + e.getMessage());
         }
 
-        if (AuditLog.isAlreadyCredited(paymentId)) {
-            AuditLog.record("webhook", null, amount, AuditLog.DECISION_DUPLICATE,
-                    "Duplicate webhook", orderId, paymentId);
-            return Response.ok(new JSONObject()
-                .put("status", "already_credited").toString()).build();
-        }
-
-        AuditLog.record("webhook", null, amount, AuditLog.DECISION_VERIFIED,
-                "payment.captured", orderId, paymentId);
+        // Log as WEBHOOK — NOT VERIFIED. The resource unlock path is the only
+        // place that writes VERIFIED, so isAlreadyCredited() won't false-positive.
+        AuditLog.record("webhook", null, amount, AuditLog.DECISION_WEBHOOK,
+                "payment.captured received", orderId, null);
 
         return Response.ok(new JSONObject()
-            .put("status",       "processed")
+            .put("status",       "acknowledged")
             .put("payment_id",   paymentId)
             .put("amount_paise", amount)
             .toString()).build();

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-agent_simulator.py  --  AgentPay x402-INR integration test.
+agent_simulator.py  --  AgentPay x402-inspired integration test.
 
 Simulates an autonomous AI agent going through the full payment lifecycle:
 
-  Phase 1  GET /agent/resource  (no proof)  -> 402 + Razorpay order
-  Phase 2  Pay via Razorpay Checkout        -> three proof tokens
+  Phase 1  GET /agent/resource  (no proof)   -> 402 + Razorpay order
+  Phase 2  Pay via Razorpay Checkout         -> three proof tokens
   Phase 3  GET /agent/resource  (with proof) -> 200 + resource data
-  Phase 4  Replay the same proof            -> 409 Conflict (expected)
+  Phase 4  Replay the same proof             -> 409 Conflict (expected)
   Phase 5  10x usage ticks -> threshold -> consolidated settlement
 
 Usage:
     pip install requests playwright
     playwright install chromium
-    python agent_simulator.py --key rzp_test_XXXXXXXXXXXX
+    python agent_simulator.py --key YOUR_RAZORPAY_KEY_ID
 """
 
 import argparse
@@ -22,7 +22,6 @@ import sys
 import time
 import requests
 
-# Windows terminals default to cp1252 which breaks the rupee sign.
 if hasattr(sys.stdout, 'reconfigure'):
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -60,14 +59,22 @@ def phase_1_request_resource():
     print(f"       Order ID : {body.get('razorpay_order_id')}")
     print(f"       Amount   : INR {amt / 100:.2f} ({amt} paise)")
     print(f"       x402 hint: {body.get('instructions')}")
-    return body["razorpay_order_id"]
+    return body["razorpay_order_id"], amt
 
 
-def phase_2_pay_via_checkout(order_id):
+def phase_2_pay_via_checkout(order_id, amount_paise):
+    """
+    Open a real Razorpay Checkout in headless Chromium and complete payment
+    via the Bank of Baroda test netbanking flow.
+
+    amount_paise is passed through so the Checkout HTML uses the actual order
+    amount rather than a hardcoded constant — fixing the settlement-order bug
+    where Phase 5 called this with 500 paise but the HTML always sent 100.
+    """
     step("PHASE 2 -- Pay via Razorpay Checkout (automated browser)")
 
     from playwright.sync_api import sync_playwright
-    import threading, http.server, socket, os
+    import threading, http.server, socket
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -78,10 +85,10 @@ def phase_2_pay_via_checkout(order_id):
 window._done = undefined;
 var rzp = new Razorpay({{
     key:         "{KEY_ID}",
-    amount:      "100",
+    amount:      "{amount_paise}",
     currency:    "INR",
     name:        "AgentPay Gateway",
-    description: "x402-INR unlock {order_id}",
+    description: "Unlock {order_id}",
     order_id:    "{order_id}",
     prefill: {{ name:"Test Agent", email:"agent@agentpay.dev", contact:"+918077907751" }},
     handler:     function(r){{ document.getElementById('r').textContent=JSON.stringify(r); window._done=r; }},
@@ -130,7 +137,7 @@ rzp.open();
                     frame = f; break
 
         if frame:
-            print("       * Checkout modal loaded.")
+            print("       * Razorpay Checkout modal loaded.")
             try: frame.wait_for_load_state("networkidle", timeout=12000)
             except Exception: pass
             page.wait_for_timeout(2000)
@@ -159,13 +166,13 @@ rzp.open();
             try:
                 frame.get_by_text("Netbanking").first.click()
                 page.wait_for_timeout(1500)
-                print("       * Payment method: Netbanking")
+                print("       * Payment method: Netbanking (domestic test rails)")
             except Exception as e:
                 print(f"       [WARN] Netbanking: {e}")
 
             try:
                 frame.get_by_text("Bank of Baroda").first.click()
-                print("       * Bank: Bank of Baroda")
+                print("       * Test bank: Bank of Baroda")
                 authorized = False
                 for _ in range(16):
                     extras = [pg for pg in ctx.pages if pg != page]
@@ -174,7 +181,7 @@ rzp.open();
                         try:
                             bp.wait_for_load_state("domcontentloaded", timeout=4000)
                             bp.get_by_role("button", name="Success").click(timeout=4000)
-                            print("       * Mock bank: authorized.")
+                            print("       * Waiting for payment callback...")
                             authorized = True
                             page.wait_for_timeout(2500)
                             break
@@ -192,7 +199,7 @@ rzp.open();
             result = page.evaluate("window._done")
             if result and result != "dismissed":
                 proof = result
-                print(f"       * Proof captured: payment_id={result.get('razorpay_payment_id','')}")
+                print(f"       * Cryptographic proof captured: payment_id={result.get('razorpay_payment_id','')}")
                 break
             page.wait_for_timeout(1000)
 
@@ -216,14 +223,14 @@ def phase_3_retry_with_proof(proof):
         "X-Razorpay-Signature":  proof["razorpay_signature"],
     })
     body = check(r, 200, "GET /agent/resource with valid proof")
-    print("       Resource unlocked!")
+    print("       Resource unlocked successfully!")
     for pt in json.loads(body["resource"]).get("data_points", []):
         print(f"         * {pt}")
     return proof
 
 
 def phase_4_replay_attack(proof):
-    step("PHASE 4 -- Replay attack (same proof, expect 409 Conflict)")
+    step("PHASE 4 -- Replay attack (duplicate proof, expect 409 Conflict)")
     r = requests.get(f"{SERVER}/agent/resource/{RESOURCE_ID}", headers={
         "X-Agent-Id":            AGENT_ID,
         "X-Razorpay-Payment-Id": proof["razorpay_payment_id"],
@@ -231,22 +238,23 @@ def phase_4_replay_attack(proof):
         "X-Razorpay-Signature":  proof["razorpay_signature"],
     })
     if r.status_code == 409:
-        print("[OK]   Replay rejected -> HTTP 409 Conflict")
-        print(f"       {r.json().get('message')}")
+        print("[OK]   Replay attack rejected -> HTTP 409 Conflict")
+        print(f"       Security enforcement: {r.json().get('message')}")
     else:
         print(f"[FAIL] Expected 409, got {r.status_code}: {r.text[:300]}")
         sys.exit(1)
 
 
 def phase_5_meter_flow():
-    step("PHASE 5 -- Usage metering (micro-ticks -> threshold -> settlement)")
+    step("PHASE 5 -- Usage metering flow (micro-usage accumulation & settlement)")
 
     url     = f"{SERVER}/agent/meter/{RESOURCE_ID}/tick"
     headers = {"X-Agent-Id": AGENT_ID, "Content-Type": "application/json"}
     payload = {"tick_paise": 50, "threshold_paise": 500}
 
-    settlement_order = None
-    print("       Ticking (INR 0.50 each, threshold INR 5.00)...")
+    settlement_order  = None
+    settlement_amount = 0
+    print("       Sending micro-usage ticks (INR 0.50 each, threshold INR 5.00)...")
 
     for i in range(15):
         r    = requests.post(url, headers=headers, json=payload)
@@ -254,24 +262,30 @@ def phase_5_meter_flow():
 
         if r.status_code == 200:
             acc = body.get("accumulated_paise", 0)
-            print(f"       Tick {i+1:2d}: INR {acc/100:.2f} / INR {body.get('threshold_paise',500)/100:.2f}")
+            thr = body.get("threshold_paise", 500)
+            print(f"       Tick {i+1:2d}: INR {acc/100:.2f} accumulated  (threshold INR {thr/100:.2f})")
         elif r.status_code == 402:
             if body.get("status") == "settlement_required":
-                settlement_order = body["razorpay_order_id"]
-                print(f"       Tick {i+1:2d}: THRESHOLD! Settlement order: {settlement_order}")
+                settlement_order  = body["razorpay_order_id"]
+                settlement_amount = body.get("accumulated_paise", 500)
+                print(f"       Tick {i+1:2d}: THRESHOLD REACHED! Settlement order: {settlement_order}")
                 break
             elif body.get("status") == "settlement_pending":
-                settlement_order = body["pending_order_id"]
+                settlement_order  = body["pending_order_id"]
+                settlement_amount = body.get("accumulated_paise", 500)
                 print(f"       Tick {i+1:2d}: Pending order: {settlement_order}")
                 break
         else:
-            print(f"[FAIL] {r.status_code}: {body}"); sys.exit(1)
+            print(f"[FAIL] Tick {i+1}: {r.status_code} {body}"); sys.exit(1)
 
     if not settlement_order:
         print("[INFO] No settlement triggered this run."); return
 
-    print(f"\n       Settling INR 5.00 via Checkout (order {settlement_order})...")
-    proof = phase_2_pay_via_checkout(settlement_order)
+    print(f"\n       Consolidated settlement: INR {settlement_amount/100:.2f} — order {settlement_order}")
+    print("       Launching automated Checkout for settlement payment...")
+
+    # Pass the actual accumulated amount so Checkout sends the correct figure.
+    proof = phase_2_pay_via_checkout(settlement_order, settlement_amount)
 
     r = requests.post(url, headers={
         **headers,
@@ -282,15 +296,16 @@ def phase_5_meter_flow():
     body = r.json()
     if r.status_code == 200 and body.get("status") == "settled":
         amt = body.get("amount_paise", 0)
-        print(f"[OK]   Settled. Ledger reset. INR {amt/100:.2f} ({amt} paise)")
+        print(f"[OK]   Meter settlement confirmed. Ledger reset to zero.")
+        print(f"       Settled: INR {amt/100:.2f} ({amt} paise)")
     else:
-        print(f"[FAIL] {r.status_code}: {body}"); sys.exit(1)
+        print(f"[FAIL] Settlement: {r.status_code} {body}"); sys.exit(1)
 
 
 def main():
     global SERVER, KEY_ID, AGENT_ID, RESOURCE_ID
 
-    p = argparse.ArgumentParser(description="AgentPay x402-INR simulator")
+    p = argparse.ArgumentParser(description="AgentPay x402-inspired simulator")
     p.add_argument("--server",     default="http://localhost:8080")
     p.add_argument("--key",        required=True, help="Razorpay Key ID")
     p.add_argument("--agent",      default="simulator-agent-001")
@@ -308,8 +323,8 @@ def main():
     print(f"  Agent   : {AGENT_ID}")
     print(f"  Resource: {RESOURCE_ID}")
 
-    order_id = phase_1_request_resource()
-    proof    = phase_2_pay_via_checkout(order_id)
+    order_id, amount_paise = phase_1_request_resource()
+    proof = phase_2_pay_via_checkout(order_id, amount_paise)
     phase_3_retry_with_proof(proof)
     phase_4_replay_attack(proof)
     if not args.skip_meter:
