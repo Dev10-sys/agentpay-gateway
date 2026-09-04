@@ -6,20 +6,12 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDate;
 
-/**
- * AgentPolicyEngine — per-agent access control and daily spending caps.
+/*
+ * Per-agent access control and daily spend cap.
  *
- * Every agent starts with a permissive default policy (allow=true,
- * daily_limit=INR 500).  The daily counter resets automatically when the
- * calendar date changes; no cron job or external scheduler is needed.
- *
- * Concurrency guarantee:
- *   checkAndDebit() opens a BEGIN IMMEDIATE transaction on SQLite, which
- *   acquires an exclusive write lock before reading the current balance.
- *   Two concurrent requests for the same agent cannot both observe
- *   "budget available" and both commit — the second one blocks until the
- *   first commits, then re-reads the updated balance.  The spending cap
- *   cannot be bypassed by concurrent callers.
+ * checkAndDebit() runs inside BEGIN IMMEDIATE so two concurrent requests
+ * for the same agent can't both read "budget available" before either commits.
+ * Daily counter resets automatically when the date changes — no cron needed.
  */
 public class AgentPolicyEngine {
 
@@ -33,26 +25,13 @@ public class AgentPolicyEngine {
         }
     }
 
-    /**
-     * Atomically checks the agent's policy and debits amountPaise from their
-     * daily budget if the request is allowed.
-     *
-     * @param agentId     identifier of the calling agent
-     * @param amountPaise spend amount in paise (pass 0 for a policy-only check)
-     * @return PolicyResult.allowed=true and the budget status, or false with
-     *         a human-readable reason if the request is blocked
-     */
     public static PolicyResult checkAndDebit(String agentId, long amountPaise) {
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
 
-            // BEGIN IMMEDIATE acquires a write lock immediately so no other
-            // writer can slip in between our SELECT and UPDATE.
             try (java.sql.Statement st = conn.createStatement()) {
                 st.execute("BEGIN IMMEDIATE");
-            } catch (SQLException e) {
-                // Already in a transaction on this connection; proceed.
-            }
+            } catch (SQLException ignored) {}
 
             try {
                 AgentDatabase.insertDefaultPolicy(conn, agentId);
@@ -67,37 +46,31 @@ public class AgentPolicyEngine {
                     try (ResultSet rs = sel.executeQuery()) {
                         if (!rs.next()) {
                             conn.rollback();
-                            return new PolicyResult(false, "Agent record missing after insert – internal error.");
+                            return new PolicyResult(false, "Agent row missing after insert.");
                         }
 
-                        int    allowed     = rs.getInt("allowed");
-                        long   limitPaise  = rs.getLong("daily_limit_paise");
-                        long   spentPaise  = rs.getLong("daily_spent_paise");
-                        String lastReset   = rs.getString("last_reset_date");
+                        int    allowed    = rs.getInt("allowed");
+                        long   limit      = rs.getLong("daily_limit_paise");
+                        long   spent      = rs.getLong("daily_spent_paise");
+                        String lastReset  = rs.getString("last_reset_date");
 
                         if (allowed == 0) {
                             conn.rollback();
-                            return new PolicyResult(false, "Agent is on the deny list.");
+                            return new PolicyResult(false, "Agent is blocked.");
                         }
 
-                        // Reset daily counter when the calendar date has changed.
-                        if (!today.equals(lastReset)) {
-                            spentPaise = 0;
-                        }
+                        if (!today.equals(lastReset)) spent = 0; // new day — reset
 
-                        if (spentPaise + amountPaise > limitPaise) {
+                        if (spent + amountPaise > limit) {
                             conn.rollback();
                             return new PolicyResult(false,
-                                String.format("Daily budget exceeded: spent=%d limit=%d requested=%d paise.",
-                                    spentPaise, limitPaise, amountPaise));
+                                String.format("Daily cap: spent=%d limit=%d requested=%d paise",
+                                    spent, limit, amountPaise));
                         }
 
-                        long newSpent = spentPaise + amountPaise;
-
+                        long newSpent = spent + amountPaise;
                         try (PreparedStatement upd = conn.prepareStatement(
-                            "UPDATE agent_policy " +
-                            "SET daily_spent_paise = ?, last_reset_date = ? " +
-                            "WHERE agent_id = ?"
+                            "UPDATE agent_policy SET daily_spent_paise=?, last_reset_date=? WHERE agent_id=?"
                         )) {
                             upd.setLong(1, newSpent);
                             upd.setString(2, today);
@@ -107,23 +80,19 @@ public class AgentPolicyEngine {
 
                         conn.commit();
                         return new PolicyResult(true,
-                            String.format("Approved. Spent today: %d / %d paise.", newSpent, limitPaise));
+                            String.format("OK. Spent today: %d / %d paise", newSpent, limit));
                     }
                 }
             } catch (SQLException e) {
                 try { conn.rollback(); } catch (SQLException ignored) {}
-                return new PolicyResult(false, "Policy engine error: " + e.getMessage());
+                return new PolicyResult(false, "Policy error: " + e.getMessage());
             }
         } catch (SQLException e) {
-            return new PolicyResult(false, "DB connection error: " + e.getMessage());
+            return new PolicyResult(false, "DB error: " + e.getMessage());
         }
     }
 
-    /**
-     * Reverses a debit, e.g. when a payment that was optimistically debited
-     * subsequently fails verification.  Uses MAX(0, ...) to guard against
-     * underflow in case of any accounting inconsistency.
-     */
+    // Reverse a debit — called when a payment fails after the budget was reserved.
     public static void refundDebit(String agentId, long amountPaise) {
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
@@ -132,9 +101,7 @@ public class AgentPolicyEngine {
             } catch (SQLException ignored) {}
 
             try (PreparedStatement upd = conn.prepareStatement(
-                "UPDATE agent_policy " +
-                "SET daily_spent_paise = MAX(0, daily_spent_paise - ?) " +
-                "WHERE agent_id = ?"
+                "UPDATE agent_policy SET daily_spent_paise=MAX(0, daily_spent_paise-?) WHERE agent_id=?"
             )) {
                 upd.setLong(1, amountPaise);
                 upd.setString(2, agentId);
@@ -149,17 +116,12 @@ public class AgentPolicyEngine {
         }
     }
 
-    /**
-     * Creates or updates a policy record for the given agent.
-     * Use this in an admin tool or integration test setup to explicitly
-     * allow/block an agent or raise their spending limit.
-     */
     public static void upsertPolicy(String agentId, boolean allowed, long dailyLimitPaise) {
         try (Connection conn = AgentDatabase.getConnection();
              PreparedStatement ps = conn.prepareStatement(
-                 "INSERT INTO agent_policy(agent_id, allowed, daily_limit_paise, daily_spent_paise, last_reset_date)" +
-                 " VALUES (?, ?, ?, 0, date('now'))" +
-                 " ON CONFLICT(agent_id) DO UPDATE SET allowed=excluded.allowed, daily_limit_paise=excluded.daily_limit_paise"
+                 "INSERT INTO agent_policy(agent_id,allowed,daily_limit_paise,daily_spent_paise,last_reset_date)" +
+                 " VALUES(?,?,?,0,date('now'))" +
+                 " ON CONFLICT(agent_id) DO UPDATE SET allowed=excluded.allowed,daily_limit_paise=excluded.daily_limit_paise"
              )) {
             ps.setString(1, agentId);
             ps.setInt(2, allowed ? 1 : 0);

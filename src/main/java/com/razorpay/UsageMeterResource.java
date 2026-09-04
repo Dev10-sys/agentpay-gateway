@@ -15,46 +15,30 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 
-/**
- * UsageMeterResource — fiat-aware micro-usage aggregation.
+/*
+ * Micro-usage metering for INR micro-payments.
  *
- * Problem this solves:
- *   x402 over Ethereum lets an AI agent pay sub-cent fees on every API call.
- *   INR on Razorpay has a practical minimum order size.  An agent making 100
- *   API calls at INR 0.50 each cannot issue 100 separate bank transactions.
+ * Problem: Razorpay has a minimum viable order size. An agent calling an API
+ * 100 times at ₹0.50 each can't create 100 separate bank transactions.
  *
- * Solution:
- *   Every tick increments a server-side paise counter in usage_ledger.
- *   When the running total reaches the configured threshold (default INR 5.00),
- *   a single consolidated Razorpay order is created.  The agent pays that
- *   order via Checkout and re-submits the tick with proof headers.  The server
- *   verifies the payment, resets the ledger to zero, and ticking resumes.
+ * Solution: ticks accumulate in a SQLite ledger. Once the running total
+ * crosses the threshold, one consolidated Razorpay order fires. Agent pays
+ * it, confirms with proof headers, ledger resets to zero.
  *
- * Endpoint:
- *   POST /agent/meter/{resourceId}/tick
+ * POST /agent/meter/{resourceId}/tick
  *
- * Request headers:
- *   X-Agent-Id                        (required)
- *   X-Razorpay-Payment-Id             (only when settling a pending order)
- *   X-Razorpay-Order-Id               (only when settling)
- *   X-Razorpay-Signature              (only when settling)
+ * Headers: X-Agent-Id (required)
+ *          X-Razorpay-Payment-Id / Order-Id / Signature  — only when settling
  *
- * Request body (optional JSON):
- *   { "tick_paise": 50, "threshold_paise": 500 }
- *
- * Response status codes:
- *   200  tick recorded, no payment due yet
- *   402  threshold reached (body contains razorpay_order_id to pay)
- *   402  pending order exists, must settle first
- *   200  settlement confirmed, ledger reset
+ * Body (optional): { "tick_paise": 50, "threshold_paise": 500 }
  */
 @Path("/agent/meter")
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class UsageMeterResource {
 
-    private static final long DEFAULT_TICK_PAISE      = 50L;
-    private static final long DEFAULT_THRESHOLD_PAISE = 500L;
+    private static final long DEFAULT_TICK      = 50L;
+    private static final long DEFAULT_THRESHOLD = 500L;
 
     private final RazorpayClient client;
     private final String         secretKey;
@@ -64,13 +48,9 @@ public class UsageMeterResource {
         try {
             this.client = new RazorpayClient(apiKey, secretKey);
         } catch (RazorpayException e) {
-            throw new RuntimeException("Failed to initialise RazorpayClient: " + e.getMessage(), e);
+            throw new RuntimeException("RazorpayClient init failed: " + e.getMessage(), e);
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Public endpoint
-    // -------------------------------------------------------------------------
 
     @POST
     @Path("/{resourceId}/tick")
@@ -82,13 +62,9 @@ public class UsageMeterResource {
             @HeaderParam("X-Razorpay-Signature")  String signature,
             String body) {
 
-        if (agentId == null || agentId.trim().isEmpty()) {
-            agentId = "anonymous-agent";
-        }
+        if (agentId == null || agentId.trim().isEmpty()) agentId = "anonymous-agent";
 
-        long tickPaise      = DEFAULT_TICK_PAISE;
-        long thresholdPaise = DEFAULT_THRESHOLD_PAISE;
-
+        long tickPaise = DEFAULT_TICK, thresholdPaise = DEFAULT_THRESHOLD;
         if (body != null && !body.trim().isEmpty()) {
             try {
                 JSONObject req = new JSONObject(body);
@@ -97,41 +73,24 @@ public class UsageMeterResource {
             } catch (Exception ignored) {}
         }
 
-        // If proof headers are present this is a settlement confirmation, not a tick.
         boolean hasProof = isNotBlank(paymentId) && isNotBlank(orderId) && isNotBlank(signature);
-        if (hasProof) {
-            return confirmSettlement(agentId, resourceId, paymentId, orderId, signature);
-        }
-
-        return processTick(agentId, resourceId, tickPaise, thresholdPaise);
+        return hasProof
+            ? confirmSettlement(agentId, resourceId, paymentId, orderId, signature)
+            : processTick(agentId, resourceId, tickPaise, thresholdPaise);
     }
 
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
+    // ----- private ---------------------------------------------------------
 
-    /**
-     * Records one usage tick.  Uses BEGIN IMMEDIATE to serialise concurrent
-     * tick requests for the same (agent, resource) pair.
-     *
-     * If adding the tick would meet or exceed the threshold, a Razorpay
-     * settlement order is created and the pending_order_id is stored in the
-     * ledger.  Subsequent ticks from the same agent are blocked until that
-     * order is paid and confirmed via confirmSettlement().
-     */
-    private Response processTick(String agentId, String resourceId,
-                                 long tickPaise, long thresholdPaise) {
-
+    private Response processTick(String agentId, String resourceId, long tickPaise, long thresholdPaise) {
         AgentPolicyEngine.PolicyResult policy = AgentPolicyEngine.checkAndDebit(agentId, 0);
         if (!policy.allowed) {
-            AuditLog.record(agentId, resourceId, tickPaise,
-                    AuditLog.DECISION_DENIED, "Policy denied: " + policy.reason, null, null);
-            return errorResponse(403, "Agent access denied: " + policy.reason);
+            AuditLog.record(agentId, resourceId, tickPaise, AuditLog.DECISION_DENIED,
+                    "Policy denied: " + policy.reason, null, null);
+            return err(403, "Agent denied: " + policy.reason);
         }
 
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
-
             try (java.sql.Statement st = conn.createStatement()) {
                 st.execute("BEGIN IMMEDIATE");
             } catch (SQLException ignored) {}
@@ -141,154 +100,118 @@ public class UsageMeterResource {
 
                 try (PreparedStatement sel = conn.prepareStatement(
                     "SELECT accumulated_paise, threshold_paise, tick_paise, pending_order_id " +
-                    "FROM usage_ledger WHERE agent_id = ? AND resource_id = ?"
+                    "FROM usage_ledger WHERE agent_id=? AND resource_id=?"
                 )) {
                     sel.setString(1, agentId);
                     sel.setString(2, resourceId);
-
                     try (ResultSet rs = sel.executeQuery()) {
-                        if (!rs.next()) {
+                        if (!rs.next()) { conn.rollback(); return err(500, "Ledger row missing."); }
+
+                        long   acc     = rs.getLong("accumulated_paise");
+                        long   thresh  = rs.getLong("threshold_paise");
+                        long   tick    = rs.getLong("tick_paise");
+                        String pending = rs.getString("pending_order_id");
+
+                        if (pending != null && !pending.isEmpty()) {
                             conn.rollback();
-                            return errorResponse(500, "Ledger row missing after insert.");
+                            return Response.status(402).entity(new JSONObject()
+                                .put("status",            "settlement_pending")
+                                .put("pending_order_id",  pending)
+                                .put("accumulated_paise", acc)
+                                .put("message",
+                                    "Settle the pending order before ticking. " +
+                                    "Retry with X-Razorpay-Payment-Id, X-Razorpay-Order-Id, X-Razorpay-Signature.")
+                                .toString()).build();
                         }
 
-                        long   accumulated  = rs.getLong("accumulated_paise");
-                        long   threshold    = rs.getLong("threshold_paise");
-                        long   tick         = rs.getLong("tick_paise");
-                        String pendingOrder = rs.getString("pending_order_id");
+                        long newAcc = acc + tick;
 
-                        // Block ticking if a settlement order is outstanding.
-                        if (pendingOrder != null && !pendingOrder.isEmpty()) {
-                            conn.rollback();
-                            JSONObject resp = new JSONObject();
-                            resp.put("status",            "settlement_pending");
-                            resp.put("pending_order_id",  pendingOrder);
-                            resp.put("accumulated_paise", accumulated);
-                            resp.put("message",
-                                "Settle the pending order before ticking further. " +
-                                "Retry with X-Razorpay-Payment-Id, X-Razorpay-Order-Id, X-Razorpay-Signature headers.");
-                            return Response.status(402).entity(resp.toString()).build();
-                        }
-
-                        long newAccumulated = accumulated + tick;
-
-                        if (newAccumulated >= threshold) {
-                            // Threshold crossed — create the consolidated settlement order.
-                            String razorpayOrderId = createSettlementOrder(agentId, resourceId, newAccumulated);
-
+                        if (newAcc >= thresh) {
+                            String settlementOrderId = createSettlementOrder(agentId, resourceId, newAcc);
                             try (PreparedStatement upd = conn.prepareStatement(
-                                "UPDATE usage_ledger " +
-                                "SET accumulated_paise = ?, pending_order_id = ? " +
-                                "WHERE agent_id = ? AND resource_id = ?"
+                                "UPDATE usage_ledger SET accumulated_paise=?, pending_order_id=? " +
+                                "WHERE agent_id=? AND resource_id=?"
                             )) {
-                                upd.setLong(1,   newAccumulated);
-                                upd.setString(2, razorpayOrderId);
+                                upd.setLong(1, newAcc);
+                                upd.setString(2, settlementOrderId);
                                 upd.setString(3, agentId);
                                 upd.setString(4, resourceId);
                                 upd.executeUpdate();
                             }
-
                             conn.commit();
-
-                            AuditLog.record(agentId, resourceId, newAccumulated,
-                                    AuditLog.DECISION_APPROVED,
-                                    "Threshold reached – settlement order: " + razorpayOrderId,
-                                    razorpayOrderId, null);
-
-                            JSONObject resp = new JSONObject();
-                            resp.put("status",            "settlement_required");
-                            resp.put("accumulated_paise", newAccumulated);
-                            resp.put("razorpay_order_id", razorpayOrderId);
-                            resp.put("message",
-                                "Accumulated " + newAccumulated + " paise. Pay the consolidated order " +
-                                "then retry this tick with settlement headers.");
-                            return Response.status(402).entity(resp.toString()).build();
+                            AuditLog.record(agentId, resourceId, newAcc, AuditLog.DECISION_APPROVED,
+                                    "Threshold – settlement order: " + settlementOrderId, settlementOrderId, null);
+                            return Response.status(402).entity(new JSONObject()
+                                .put("status",            "settlement_required")
+                                .put("accumulated_paise", newAcc)
+                                .put("razorpay_order_id", settlementOrderId)
+                                .put("message", "Pay the consolidated order then retry with settlement headers.")
+                                .toString()).build();
                         }
 
-                        // Below threshold — just record the tick.
                         try (PreparedStatement upd = conn.prepareStatement(
-                            "UPDATE usage_ledger SET accumulated_paise = ? " +
-                            "WHERE agent_id = ? AND resource_id = ?"
+                            "UPDATE usage_ledger SET accumulated_paise=? WHERE agent_id=? AND resource_id=?"
                         )) {
-                            upd.setLong(1,   newAccumulated);
+                            upd.setLong(1, newAcc);
                             upd.setString(2, agentId);
                             upd.setString(3, resourceId);
                             upd.executeUpdate();
                         }
-
                         conn.commit();
-
-                        AuditLog.record(agentId, resourceId, tick,
-                                AuditLog.DECISION_APPROVED,
-                                String.format("Tick: %d / %d paise", newAccumulated, threshold),
-                                null, null);
-
-                        JSONObject resp = new JSONObject();
-                        resp.put("status",            "tick_accepted");
-                        resp.put("accumulated_paise", newAccumulated);
-                        resp.put("threshold_paise",   threshold);
-                        resp.put("remaining_paise",   threshold - newAccumulated);
-                        resp.put("message",           "Tick recorded. No payment due yet.");
-                        return Response.ok(resp.toString()).build();
+                        AuditLog.record(agentId, resourceId, tick, AuditLog.DECISION_APPROVED,
+                                String.format("Tick: %d/%d paise", newAcc, thresh), null, null);
+                        return Response.ok(new JSONObject()
+                            .put("status",            "tick_accepted")
+                            .put("accumulated_paise", newAcc)
+                            .put("threshold_paise",   thresh)
+                            .put("remaining_paise",   thresh - newAcc)
+                            .put("message",           "Tick recorded. No payment due yet.")
+                            .toString()).build();
                     }
                 }
             } catch (Exception e) {
                 try { conn.rollback(); } catch (SQLException ignored) {}
-                return errorResponse(500, "Tick processing failed: " + e.getMessage());
+                return err(500, "Tick failed: " + e.getMessage());
             }
         } catch (SQLException e) {
-            return errorResponse(500, "DB connection failed: " + e.getMessage());
+            return err(500, "DB error: " + e.getMessage());
         }
     }
 
-    /**
-     * Verifies the settlement payment and resets the ledger if valid.
-     * The order_id in the proof must match the pending_order_id in the
-     * ledger — stale or mismatched proofs are rejected.
-     */
     private Response confirmSettlement(String agentId, String resourceId,
                                        String paymentId, String orderId, String signature) {
-
-        // Replay guard — same payment_id cannot settle twice.
         if (AuditLog.isAlreadyCredited(paymentId)) {
-            return errorResponse(409, "Payment " + paymentId + " already credited. Replay rejected.");
+            return err(409, "Payment " + paymentId + " already credited. Replay rejected.");
         }
-
-        // HMAC-SHA256 verification.
-        JSONObject sigOpts = new JSONObject();
-        sigOpts.put("razorpay_payment_id", paymentId);
-        sigOpts.put("razorpay_order_id",   orderId);
-        sigOpts.put("razorpay_signature",  signature);
 
         boolean sigValid;
         try {
-            sigValid = Utils.verifyPaymentSignature(sigOpts, secretKey);
+            sigValid = Utils.verifyPaymentSignature(new JSONObject()
+                .put("razorpay_payment_id", paymentId)
+                .put("razorpay_order_id",   orderId)
+                .put("razorpay_signature",  signature), secretKey);
         } catch (RazorpayException e) {
-            return errorResponse(400, "Signature verification error: " + e.getMessage());
+            return err(400, "Sig verify error: " + e.getMessage());
         }
 
         if (!sigValid) {
-            AuditLog.record(agentId, resourceId, 0,
-                    AuditLog.DECISION_DENIED, "Settlement signature invalid.", orderId, paymentId);
-            return errorResponse(401, "Settlement signature is invalid.");
+            AuditLog.record(agentId, resourceId, 0, AuditLog.DECISION_DENIED,
+                    "Settlement sig invalid", orderId, paymentId);
+            return err(401, "Settlement signature invalid.");
         }
 
-        // Confirm payment is captured on Razorpay.
         Payment payment;
         try {
             payment = client.Payments.fetch(paymentId);
         } catch (RazorpayException e) {
-            return errorResponse(502, "Payment fetch failed: " + e.getMessage());
+            return err(502, "Payment fetch failed: " + e.getMessage());
         }
 
         String status = (String) payment.get("status");
-        if (!"captured".equals(status)) {
-            return errorResponse(402, "Settlement payment not captured. Status: " + status);
-        }
+        if (!"captured".equals(status)) return err(402, "Payment not captured. Status: " + status);
 
         int capturedPaise = (int) payment.get("amount");
 
-        // Verify orderId matches the pending order and reset the ledger.
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
             try (java.sql.Statement st = conn.createStatement()) {
@@ -296,85 +219,64 @@ public class UsageMeterResource {
             } catch (SQLException ignored) {}
 
             try (PreparedStatement sel = conn.prepareStatement(
-                "SELECT pending_order_id FROM usage_ledger " +
-                "WHERE agent_id = ? AND resource_id = ?"
+                "SELECT pending_order_id FROM usage_ledger WHERE agent_id=? AND resource_id=?"
             )) {
                 sel.setString(1, agentId);
                 sel.setString(2, resourceId);
                 try (ResultSet rs = sel.executeQuery()) {
-                    if (!rs.next()) {
+                    if (!rs.next()) { conn.rollback(); return err(404, "No ledger row found."); }
+                    String pendingOrder = rs.getString("pending_order_id");
+                    if (!orderId.equals(pendingOrder)) {
                         conn.rollback();
-                        return errorResponse(404, "No ledger row found for this agent and resource.");
-                    }
-                    String pendingOrderId = rs.getString("pending_order_id");
-                    if (!orderId.equals(pendingOrderId)) {
-                        conn.rollback();
-                        return errorResponse(400,
-                            "Order ID mismatch. Expected pending order: " + pendingOrderId);
+                        return err(400, "Order ID mismatch. Expected: " + pendingOrder);
                     }
                 }
             }
 
             try (PreparedStatement upd = conn.prepareStatement(
-                "UPDATE usage_ledger " +
-                "SET accumulated_paise = 0, pending_order_id = NULL " +
-                "WHERE agent_id = ? AND resource_id = ?"
+                "UPDATE usage_ledger SET accumulated_paise=0, pending_order_id=NULL " +
+                "WHERE agent_id=? AND resource_id=?"
             )) {
                 upd.setString(1, agentId);
                 upd.setString(2, resourceId);
                 upd.executeUpdate();
             }
-
             conn.commit();
 
         } catch (SQLException e) {
-            return errorResponse(500, "DB error during settlement: " + e.getMessage());
+            return err(500, "DB error during settlement: " + e.getMessage());
         }
 
-        // Debit the settled amount from the agent's daily budget.
         AgentPolicyEngine.checkAndDebit(agentId, capturedPaise);
+        AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_VERIFIED,
+                "Meter settled. Ledger reset.", orderId, paymentId);
 
-        AuditLog.record(agentId, resourceId, capturedPaise,
-                AuditLog.DECISION_VERIFIED,
-                "Meter settlement confirmed. Ledger reset.",
-                orderId, paymentId);
-
-        JSONObject resp = new JSONObject();
-        resp.put("status",       "settled");
-        resp.put("amount_paise", capturedPaise);
-        resp.put("message",      "Settlement confirmed. Ledger reset to zero. Ticking resumed.");
-        return Response.ok(resp.toString()).build();
+        return Response.ok(new JSONObject()
+            .put("status",       "settled")
+            .put("amount_paise", capturedPaise)
+            .put("message",      "Settlement confirmed. Ledger reset to zero. Ticking resumed.")
+            .toString()).build();
     }
 
-    /**
-     * Creates a Razorpay order for the consolidated settlement amount.
-     * Notes on the order tag it as a meter settlement for dashboard filtering.
-     */
     private String createSettlementOrder(String agentId, String resourceId, long amountPaise)
             throws RazorpayException {
-        JSONObject opts = new JSONObject();
-        opts.put("amount",          amountPaise);
-        opts.put("currency",        "INR");
-        opts.put("receipt",         "meter_" + resourceId + "_" + System.currentTimeMillis());
-        opts.put("payment_capture", 1);
-
-        JSONObject notes = new JSONObject();
-        notes.put("agent_id",    agentId);
-        notes.put("resource_id", resourceId);
-        notes.put("type",        "usage_meter_settlement");
-        opts.put("notes", notes);
-
-        Order order = client.Orders.create(opts);
+        Order order = client.Orders.create(new JSONObject()
+            .put("amount",          amountPaise)
+            .put("currency",        "INR")
+            .put("receipt",         "meter_" + resourceId + "_" + System.currentTimeMillis())
+            .put("payment_capture", 1)
+            .put("notes", new JSONObject()
+                .put("agent_id",    agentId)
+                .put("resource_id", resourceId)
+                .put("type",        "usage_meter_settlement")));
         return (String) order.get("id");
     }
 
-    /** Inserts a ledger row if one does not already exist for (agent, resource). */
     private void ensureLedgerRow(Connection conn, String agentId, String resourceId,
                                  long thresholdPaise, long tickPaise) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
             "INSERT OR IGNORE INTO usage_ledger" +
-            "(agent_id, resource_id, accumulated_paise, threshold_paise, tick_paise)" +
-            " VALUES (?, ?, 0, ?, ?)"
+            "(agent_id,resource_id,accumulated_paise,threshold_paise,tick_paise) VALUES(?,?,0,?,?)"
         )) {
             ps.setString(1, agentId);
             ps.setString(2, resourceId);
@@ -384,10 +286,10 @@ public class UsageMeterResource {
         }
     }
 
-    private Response errorResponse(int status, String message) {
+    private Response err(int status, String message) {
         return Response.status(status)
-                .entity(new JSONObject().put("error", true).put("message", message).toString())
-                .build();
+            .entity(new JSONObject().put("error", true).put("message", message).toString())
+            .build();
     }
 
     private boolean isNotBlank(String s) {
