@@ -5,12 +5,19 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 
 /**
- * AuditLog writes an immutable record for every gateway decision.
+ * AuditLog — append-only ledger of every gateway decision.
  *
- * The unique index on razorpay_payment_id (defined in AgentDatabase) means
- * inserting the same payment_id twice raises a constraint violation, which is
- * the idempotency guard: a duplicate webhook or a replayed proof header will
- * be detected before any resource is released.
+ * Every request that touches a protected resource or usage meter writes
+ * a row here, regardless of outcome.  This gives the operator a complete,
+ * tamper-evident history of what was paid, when, by whom, and what happened.
+ *
+ * Replay protection:
+ *   The unique index idx_audit_payment on razorpay_payment_id (created in
+ *   AgentDatabase) means that calling record() twice with the same
+ *   payment_id and decision=VERIFIED raises a SQLite constraint violation.
+ *   isAlreadyCredited() queries that index to detect duplicates before
+ *   the insert, returning a clean 409 to the caller rather than relying
+ *   on the database error alone.
  */
 public class AuditLog {
 
@@ -21,20 +28,21 @@ public class AuditLog {
     public static final String DECISION_ERROR     = "ERROR";
 
     /**
-     * Appends a row to audit_log.
+     * Appends one row to audit_log.  Failures are logged to stderr but not
+     * re-thrown — a failing audit write must not break the payment flow.
      *
      * @param agentId           calling agent identifier
-     * @param resourceId        resource that was requested (nullable)
-     * @param amountPaise       amount in paise (0 if not applicable)
-     * @param decision          one of the DECISION_* constants
-     * @param reason            human-readable explanation
+     * @param resourceId        resource that was requested (may be null)
+     * @param amountPaise       transaction amount in paise; 0 if not applicable
+     * @param decision          one of the DECISION_* constants above
+     * @param reason            human-readable explanation for this decision
      * @param razorpayOrderId   Razorpay order id (nullable)
-     * @param razorpayPaymentId Razorpay payment id (nullable); must be unique
-     *                          among VERIFIED rows for idempotency enforcement
+     * @param razorpayPaymentId Razorpay payment id (nullable); enforced unique
+     *                          among VERIFIED rows by the database index
      */
     public static void record(String agentId, String resourceId, long amountPaise,
-                               String decision, String reason,
-                               String razorpayOrderId, String razorpayPaymentId) {
+                              String decision, String reason,
+                              String razorpayOrderId, String razorpayPaymentId) {
         try (Connection conn = AgentDatabase.getConnection();
              PreparedStatement ps = conn.prepareStatement(
                  "INSERT INTO audit_log" +
@@ -51,13 +59,15 @@ public class AuditLog {
             ps.setString(7, razorpayPaymentId);
             ps.executeUpdate();
         } catch (SQLException e) {
-            System.err.println("[AuditLog] Failed to write record: " + e.getMessage());
+            System.err.println("[AuditLog] record() failed: " + e.getMessage());
         }
     }
 
     /**
-     * Returns true if this payment_id already has a VERIFIED entry, meaning
-     * the payment has already been credited.  Used to detect replay attacks.
+     * Returns true if razorpayPaymentId already has a VERIFIED entry in the
+     * audit log, meaning this payment has been credited before.  Used by
+     * both AgentGatewayResource and UsageMeterResource to reject replays
+     * before touching any ledger state.
      */
     public static boolean isAlreadyCredited(String razorpayPaymentId) {
         if (razorpayPaymentId == null || razorpayPaymentId.isEmpty()) return false;
@@ -72,7 +82,7 @@ public class AuditLog {
                 return rs.next();
             }
         } catch (SQLException e) {
-            System.err.println("[AuditLog] isAlreadyCredited check failed: " + e.getMessage());
+            System.err.println("[AuditLog] isAlreadyCredited() failed: " + e.getMessage());
             return false;
         }
     }

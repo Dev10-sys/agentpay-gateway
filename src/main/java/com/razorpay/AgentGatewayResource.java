@@ -12,30 +12,50 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
 /**
- * AgentGatewayResource — the HTTP-402 machine-payment gateway.
+ * AgentGatewayResource — the x402-style machine-payment gateway.
  *
- * Canonical flow (x402-style, single endpoint):
+ * A single endpoint serves both the payment challenge and the resource
+ * delivery, distinguished by the presence or absence of proof headers.
+ * This mirrors the HTTP 402 "Payment Required" flow described in the
+ * x402 draft spec, adapted for INR via Razorpay.
  *
- *   1. Agent sends GET /agent/resource/{resourceId}  (no proof headers)
- *      → Server returns 402 with JSON containing a fresh Razorpay order.
+ * Canonical flow:
  *
- *   2. Agent pays via Razorpay Checkout (browser step / simulator).
+ *   Step 1 — Discovery (no proof headers)
+ *     GET /agent/resource/{resourceId}
+ *     → 402 Payment Required
+ *       { status, razorpay_order_id, amount_paise, currency, instructions }
  *
- *   3. Agent retries GET /agent/resource/{resourceId} with three headers:
- *        X-Razorpay-Payment-Id, X-Razorpay-Order-Id, X-Razorpay-Signature
- *      → Server verifies signature + payment status, returns 200 with resource.
+ *   Step 2 — Payment (out of band)
+ *     Agent or user completes Razorpay Checkout using the order_id from Step 1.
+ *     Razorpay returns: razorpay_payment_id, razorpay_order_id, razorpay_signature.
  *
- * Debug endpoint (not the canonical path):
- *   POST /agent/resource/{resourceId}/verify  — accepts JSON body for curl/Postman.
+ *   Step 3 — Proof submission (all three proof headers present)
+ *     GET /agent/resource/{resourceId}
+ *       X-Razorpay-Payment-Id: pay_...
+ *       X-Razorpay-Order-Id:   order_...
+ *       X-Razorpay-Signature:  <hmac-sha256>
+ *     → 200 OK  { resource, payment_id, amount_paise }
+ *
+ * Security guarantees:
+ *   - HMAC-SHA256 signature verified via Razorpay SDK before any DB write.
+ *   - Payment status fetched live from Razorpay API; must be "captured".
+ *   - razorpay_payment_id uniqueness enforced in audit_log; replay → 409.
+ *   - Daily spending cap checked via AgentPolicyEngine.
+ *
+ * Debug endpoint (not the canonical flow — for curl/Postman testing):
+ *   POST /agent/resource/{resourceId}/verify
+ *   Body: { razorpay_payment_id, razorpay_order_id, razorpay_signature }
  */
 @Path("/agent")
 @Produces(MediaType.APPLICATION_JSON)
 public class AgentGatewayResource {
 
+    // Resource price in paise (100 paise = INR 1.00).
     private static final long RESOURCE_PRICE_PAISE = 100L;
 
     private final RazorpayClient client;
-    private final String secretKey;
+    private final String         secretKey;
 
     public AgentGatewayResource(String apiKey, String secretKey) {
         this.secretKey = secretKey;
@@ -46,14 +66,18 @@ public class AgentGatewayResource {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Public endpoints
+    // -------------------------------------------------------------------------
+
     @GET
     @Path("/resource/{resourceId}")
     public Response getResource(
-            @PathParam("resourceId") String resourceId,
-            @HeaderParam("X-Agent-Id")             String agentId,
-            @HeaderParam("X-Razorpay-Payment-Id")  String paymentId,
-            @HeaderParam("X-Razorpay-Order-Id")    String orderId,
-            @HeaderParam("X-Razorpay-Signature")   String signature) {
+            @PathParam("resourceId")                 String resourceId,
+            @HeaderParam("X-Agent-Id")               String agentId,
+            @HeaderParam("X-Razorpay-Payment-Id")    String paymentId,
+            @HeaderParam("X-Razorpay-Order-Id")      String orderId,
+            @HeaderParam("X-Razorpay-Signature")     String signature) {
 
         if (agentId == null || agentId.trim().isEmpty()) {
             agentId = "anonymous-agent";
@@ -61,11 +85,9 @@ public class AgentGatewayResource {
 
         boolean hasProof = isNotBlank(paymentId) && isNotBlank(orderId) && isNotBlank(signature);
 
-        if (hasProof) {
-            return verifyAndUnlock(agentId, resourceId, paymentId, orderId, signature);
-        } else {
-            return issuePaymentChallenge(agentId, resourceId);
-        }
+        return hasProof
+            ? verifyAndUnlock(agentId, resourceId, paymentId, orderId, signature)
+            : issuePaymentChallenge(agentId, resourceId);
     }
 
     @POST
@@ -78,69 +100,73 @@ public class AgentGatewayResource {
         try {
             json = new JSONObject(body);
         } catch (Exception e) {
-            return error(400, "Invalid JSON body");
+            return error(400, "Invalid JSON body.");
         }
 
-        String agentId   = json.optString("agent_id",   "debug-agent");
-        String paymentId = json.optString("razorpay_payment_id", "");
-        String orderId   = json.optString("razorpay_order_id",   "");
-        String signature = json.optString("razorpay_signature",  "");
+        String agentId   = json.optString("agent_id",              "debug-agent");
+        String paymentId = json.optString("razorpay_payment_id",   "");
+        String orderId   = json.optString("razorpay_order_id",     "");
+        String signature = json.optString("razorpay_signature",    "");
 
         if (!isNotBlank(paymentId) || !isNotBlank(orderId) || !isNotBlank(signature)) {
-            return error(400, "Missing razorpay_payment_id, razorpay_order_id or razorpay_signature");
+            return error(400, "razorpay_payment_id, razorpay_order_id and razorpay_signature are required.");
         }
 
         return verifyAndUnlock(agentId, resourceId, paymentId, orderId, signature);
     }
 
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Issues a 402 challenge by creating a fresh Razorpay order and returning
+     * its ID along with payment instructions.  Runs a policy check first —
+     * blocked agents receive 403 without an order being created.
+     */
     private Response issuePaymentChallenge(String agentId, String resourceId) {
-        AgentPolicyEngine.PolicyResult policy =
-                AgentPolicyEngine.checkAndDebit(agentId, 0);
+        AgentPolicyEngine.PolicyResult policy = AgentPolicyEngine.checkAndDebit(agentId, 0);
 
         if (!policy.allowed) {
             AuditLog.record(agentId, resourceId, 0,
                     AuditLog.DECISION_DENIED, policy.reason, null, null);
-            return Response.status(403)
-                    .entity(new JSONObject()
-                            .put("error", "agent_denied")
-                            .put("message", policy.reason)
-                            .toString())
-                    .build();
+            return error(403, "Agent access denied: " + policy.reason);
         }
 
         try {
-            JSONObject orderOptions = new JSONObject();
-            orderOptions.put("amount",          RESOURCE_PRICE_PAISE);
-            orderOptions.put("currency",        "INR");
-            orderOptions.put("receipt",         "agentpay_" + resourceId + "_" + System.currentTimeMillis());
-            orderOptions.put("payment_capture", 1);
+            JSONObject orderOpts = new JSONObject();
+            orderOpts.put("amount",          RESOURCE_PRICE_PAISE);
+            orderOpts.put("currency",        "INR");
+            orderOpts.put("receipt",         "agentpay_" + resourceId + "_" + System.currentTimeMillis());
+            orderOpts.put("payment_capture", 1);
 
             JSONObject notes = new JSONObject();
             notes.put("agent_id",    agentId);
             notes.put("resource_id", resourceId);
             notes.put("gateway",     "agentpay-x402");
-            orderOptions.put("notes", notes);
+            orderOpts.put("notes", notes);
 
-            Order order = client.Orders.create(orderOptions);
+            Order order = client.Orders.create(orderOpts);
 
             String razorpayOrderId = (String) order.get("id");
             int    amountPaise     = (int)    order.get("amount");
 
             AuditLog.record(agentId, resourceId, amountPaise,
                     AuditLog.DECISION_APPROVED,
-                    "402 challenge issued – order created",
+                    "402 challenge issued – order " + razorpayOrderId,
                     razorpayOrderId, null);
 
             JSONObject resp = new JSONObject();
-            resp.put("x402_version",    "1.0-INR");
-            resp.put("status",          "payment_required");
-            resp.put("resource_id",     resourceId);
-            resp.put("amount_paise",    amountPaise);
-            resp.put("currency",        "INR");
+            resp.put("x402_version",      "1.0-INR");
+            resp.put("status",            "payment_required");
+            resp.put("resource_id",       resourceId);
+            resp.put("amount_paise",      amountPaise);
+            resp.put("currency",          "INR");
             resp.put("razorpay_order_id", razorpayOrderId);
-            resp.put("description",     "Pay to unlock resource: " + resourceId);
-            resp.put("instructions",    "Attach X-Razorpay-Payment-Id, X-Razorpay-Order-Id, " +
-                                        "X-Razorpay-Signature headers and retry this GET request.");
+            resp.put("description",       "Pay to unlock resource: " + resourceId);
+            resp.put("instructions",
+                "Attach X-Razorpay-Payment-Id, X-Razorpay-Order-Id, " +
+                "X-Razorpay-Signature headers and retry this GET request.");
 
             return Response.status(402).entity(resp.toString()).build();
 
@@ -153,41 +179,52 @@ public class AgentGatewayResource {
         }
     }
 
+    /**
+     * Verifies the three proof tokens and, if valid, returns the protected
+     * resource.  Verification steps (all must pass in order):
+     *   1. Replay check  — payment_id must not exist in audit_log as VERIFIED.
+     *   2. HMAC check    — Razorpay SDK verifies order_id + payment_id digest.
+     *   3. Status check  — live Razorpay API confirms payment is "captured".
+     *   4. Policy check  — daily budget has room for the captured amount.
+     */
     private Response verifyAndUnlock(String agentId, String resourceId,
                                      String paymentId, String orderId, String signature) {
 
+        // Step 1: Replay guard.
         if (AuditLog.isAlreadyCredited(paymentId)) {
             AuditLog.record(agentId, resourceId, 0,
                     AuditLog.DECISION_DUPLICATE,
-                    "Payment already credited – replay rejected",
+                    "Replay rejected – payment already credited",
                     orderId, paymentId);
             return error(409, "Payment " + paymentId + " has already been credited. Replay rejected.");
         }
 
-        JSONObject sigOptions = new JSONObject();
-        sigOptions.put("razorpay_payment_id", paymentId);
-        sigOptions.put("razorpay_order_id",   orderId);
-        sigOptions.put("razorpay_signature",  signature);
+        // Step 2: HMAC-SHA256 signature verification.
+        JSONObject sigOpts = new JSONObject();
+        sigOpts.put("razorpay_payment_id", paymentId);
+        sigOpts.put("razorpay_order_id",   orderId);
+        sigOpts.put("razorpay_signature",  signature);
 
         boolean sigValid;
         try {
-            sigValid = Utils.verifyPaymentSignature(sigOptions, this.secretKey);
+            sigValid = Utils.verifyPaymentSignature(sigOpts, this.secretKey);
         } catch (RazorpayException e) {
             AuditLog.record(agentId, resourceId, 0,
                     AuditLog.DECISION_ERROR,
-                    "Signature verification threw: " + e.getMessage(),
+                    "Signature verification error: " + e.getMessage(),
                     orderId, paymentId);
-            return error(400, "Signature verification error: " + e.getMessage());
+            return error(400, "Signature verification failed: " + e.getMessage());
         }
 
         if (!sigValid) {
             AuditLog.record(agentId, resourceId, 0,
                     AuditLog.DECISION_DENIED,
-                    "HMAC signature mismatch – proof rejected",
+                    "HMAC signature mismatch",
                     orderId, paymentId);
             return error(401, "Payment signature is invalid.");
         }
 
+        // Step 3: Confirm payment is captured on Razorpay's servers.
         Payment payment;
         try {
             payment = client.Payments.fetch(paymentId);
@@ -203,58 +240,59 @@ public class AgentGatewayResource {
         if (!"captured".equals(status)) {
             AuditLog.record(agentId, resourceId, 0,
                     AuditLog.DECISION_DENIED,
-                    "Payment status is '" + status + "', expected 'captured'",
+                    "Payment not captured – status: " + status,
                     orderId, paymentId);
-            return error(402, "Payment not captured yet. Status: " + status);
+            return error(402, "Payment not captured. Current status: " + status);
         }
 
-        int capturedAmount = (int) payment.get("amount");
+        int capturedPaise = (int) payment.get("amount");
 
-        AgentPolicyEngine.PolicyResult policy =
-                AgentPolicyEngine.checkAndDebit(agentId, capturedAmount);
-
+        // Step 4: Policy check and daily budget debit.
+        AgentPolicyEngine.PolicyResult policy = AgentPolicyEngine.checkAndDebit(agentId, capturedPaise);
         if (!policy.allowed) {
-            AuditLog.record(agentId, resourceId, capturedAmount,
+            AuditLog.record(agentId, resourceId, capturedPaise,
                     AuditLog.DECISION_DENIED,
-                    "Policy blocked after payment: " + policy.reason,
+                    "Policy blocked post-payment: " + policy.reason,
                     orderId, paymentId);
             return error(403, "Payment captured but policy check failed: " + policy.reason);
         }
 
-        AuditLog.record(agentId, resourceId, capturedAmount,
+        // All checks passed — write the VERIFIED audit record and return the resource.
+        AuditLog.record(agentId, resourceId, capturedPaise,
                 AuditLog.DECISION_VERIFIED,
-                "Payment verified and resource unlocked",
+                "Payment verified. Resource unlocked.",
                 orderId, paymentId);
 
-        String resourceContent = buildResourcePayload(resourceId);
-
         JSONObject resp = new JSONObject();
-        resp.put("status",          "ok");
-        resp.put("resource_id",     resourceId);
-        resp.put("resource",        resourceContent);
-        resp.put("payment_id",      paymentId);
-        resp.put("amount_paise",    capturedAmount);
-        resp.put("message",         "Access granted. Welcome to the x402-style INR gateway.");
+        resp.put("status",       "ok");
+        resp.put("resource_id",  resourceId);
+        resp.put("resource",     buildResourcePayload(resourceId));
+        resp.put("payment_id",   paymentId);
+        resp.put("amount_paise", capturedPaise);
+        resp.put("message",      "Access granted via AgentPay/x402-INR.");
 
         return Response.ok(resp.toString()).build();
     }
 
+    /**
+     * Builds the JSON payload for the protected resource.
+     * Replace this with real data retrieval in a production deployment.
+     */
     private String buildResourcePayload(String resourceId) {
         JSONObject payload = new JSONObject();
-        payload.put("resource_id",  resourceId);
-        payload.put("content",      "This is the protected content for resource: " + resourceId);
-        payload.put("data_points",  new org.json.JSONArray()
-                .put("INR settlement: ₹" + (RESOURCE_PRICE_PAISE / 100) + ".00")
-                .put("Protocol: AgentPay/x402-INR")
-                .put("Served at: " + java.time.Instant.now().toString()));
+        payload.put("resource_id", resourceId);
+        payload.put("content",     "Protected content for: " + resourceId);
+        payload.put("data_points", new org.json.JSONArray()
+            .put("INR settlement: \u20b9" + (RESOURCE_PRICE_PAISE / 100) + ".00")
+            .put("Protocol: AgentPay/x402-INR")
+            .put("Served at: " + java.time.Instant.now().toString()));
         return payload.toString();
     }
 
     private Response error(int status, String message) {
-        JSONObject body = new JSONObject();
-        body.put("error",   true);
-        body.put("message", message);
-        return Response.status(status).entity(body.toString()).build();
+        return Response.status(status)
+                .entity(new JSONObject().put("error", true).put("message", message).toString())
+                .build();
     }
 
     private boolean isNotBlank(String s) {

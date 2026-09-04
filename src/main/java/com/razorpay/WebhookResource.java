@@ -11,11 +11,25 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
 /**
- * WebhookResource validates inbound Razorpay webhook events using the SDK's
- * Utils.verifyWebhookSignature and enforces idempotency before acting on them.
+ * WebhookResource — receives and validates inbound Razorpay webhook events.
  *
- * Endpoint:  POST /webhook/razorpay
- * Headers:   X-Razorpay-Signature  (sent by Razorpay, required)
+ * Razorpay sends a POST to this endpoint for every payment lifecycle event
+ * (captured, failed, refunded, etc.).  The webhook signature header is
+ * verified with the Razorpay SDK before any payload is processed.
+ *
+ * Idempotency: events that reference a payment_id already present in
+ * audit_log as VERIFIED are acknowledged but not re-processed.  This makes
+ * the handler safe to receive Razorpay's duplicate delivery retries.
+ *
+ * Endpoint: POST /webhook/razorpay
+ *
+ * To enable webhooks:
+ *   1. Set RAZORPAY_WEBHOOK_SECRET in the environment.
+ *   2. Register https://your-host/webhook/razorpay in the Razorpay dashboard.
+ *   3. Select the "payment.captured" event (minimum required by AgentPay).
+ *
+ * For local testing, use the Razorpay dashboard's "Test Webhook" button or
+ * a tool like ngrok to expose the local server.
  */
 @Path("/webhook")
 @Produces(MediaType.APPLICATION_JSON)
@@ -36,6 +50,8 @@ public class WebhookResource {
             @HeaderParam("X-Razorpay-Signature") String webhookSig,
             String body) {
 
+        // Webhook secret is optional in server.yml; return 503 if not configured
+        // rather than silently accepting unverified events.
         if (webhookSecret == null || webhookSecret.trim().isEmpty()) {
             return error(503, "Webhook secret not configured on this server.");
         }
@@ -52,7 +68,7 @@ public class WebhookResource {
         }
 
         if (!sigValid) {
-            return error(401, "Webhook signature invalid. Possible tampering.");
+            return error(401, "Webhook signature invalid.");
         }
 
         JSONObject event;
@@ -68,17 +84,18 @@ public class WebhookResource {
             return handlePaymentCaptured(event);
         }
 
+        // Unknown event types are acknowledged with 200 but not processed.
         return Response.ok(new JSONObject()
                 .put("status",  "ignored")
                 .put("event",   eventType)
-                .put("message", "Event type not handled by AgentPay gateway.")
+                .put("message", "Event type not handled by AgentPay.")
                 .toString()).build();
     }
 
     private Response handlePaymentCaptured(JSONObject event) {
-        String paymentId = null;
-        String orderId   = null;
-        long   amount    = 0;
+        String paymentId;
+        String orderId;
+        long   amount;
 
         try {
             JSONObject payload = event.getJSONObject("payload");
@@ -90,14 +107,15 @@ public class WebhookResource {
             return error(400, "Malformed payment.captured payload: " + e.getMessage());
         }
 
+        // Idempotency: acknowledge without re-processing.
         if (AuditLog.isAlreadyCredited(paymentId)) {
             AuditLog.record("webhook", null, amount,
                     AuditLog.DECISION_DUPLICATE,
-                    "Webhook payment.captured duplicate – already credited",
+                    "Duplicate webhook – already credited",
                     orderId, paymentId);
             return Response.ok(new JSONObject()
                     .put("status",  "already_credited")
-                    .put("message", "Idempotency: this payment_id was already processed.")
+                    .put("message", "Idempotency: payment already processed.")
                     .toString()).build();
         }
 
@@ -107,8 +125,8 @@ public class WebhookResource {
                 orderId, paymentId);
 
         return Response.ok(new JSONObject()
-                .put("status",  "processed")
-                .put("payment_id", paymentId)
+                .put("status",       "processed")
+                .put("payment_id",   paymentId)
                 .put("amount_paise", amount)
                 .toString()).build();
     }

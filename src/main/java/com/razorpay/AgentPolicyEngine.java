@@ -7,51 +7,51 @@ import java.sql.SQLException;
 import java.time.LocalDate;
 
 /**
- * AgentPolicyEngine enforces per-agent access control and daily spending caps.
+ * AgentPolicyEngine — per-agent access control and daily spending caps.
  *
- * Key design guarantee: every read-check-then-write against daily_spent_paise
- * runs inside a single BEGIN IMMEDIATE transaction.  SQLite's IMMEDIATE mode
- * acquires a write lock at the start, so two concurrent requests for the same
- * agent cannot both observe "budget available" before either has committed its
- * update.  The cap cannot be bypassed by racing callers.
+ * Every agent starts with a permissive default policy (allow=true,
+ * daily_limit=INR 500).  The daily counter resets automatically when the
+ * calendar date changes; no cron job or external scheduler is needed.
+ *
+ * Concurrency guarantee:
+ *   checkAndDebit() opens a BEGIN IMMEDIATE transaction on SQLite, which
+ *   acquires an exclusive write lock before reading the current balance.
+ *   Two concurrent requests for the same agent cannot both observe
+ *   "budget available" and both commit — the second one blocks until the
+ *   first commits, then re-reads the updated balance.  The spending cap
+ *   cannot be bypassed by concurrent callers.
  */
 public class AgentPolicyEngine {
 
     public static class PolicyResult {
         public final boolean allowed;
-        public final String reason;
+        public final String  reason;
 
         PolicyResult(boolean allowed, String reason) {
             this.allowed = allowed;
-            this.reason = reason;
+            this.reason  = reason;
         }
     }
 
     /**
-     * Checks whether an agent is allowed to spend the given amount, and if so,
-     * atomically debits that amount from their daily budget.  Returns a
-     * PolicyResult indicating whether the request is allowed and why.
+     * Atomically checks the agent's policy and debits amountPaise from their
+     * daily budget if the request is allowed.
      *
      * @param agentId     identifier of the calling agent
-     * @param amountPaise amount the agent wants to spend (in paise)
+     * @param amountPaise spend amount in paise (pass 0 for a policy-only check)
+     * @return PolicyResult.allowed=true and the budget status, or false with
+     *         a human-readable reason if the request is blocked
      */
     public static PolicyResult checkAndDebit(String agentId, long amountPaise) {
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
 
-            try (PreparedStatement lock = conn.prepareStatement(
-                "BEGIN IMMEDIATE"
-            )) {
-                lock.execute();
-            } catch (SQLException ignored) {
-                // BEGIN IMMEDIATE not available as prepared statement in all drivers;
-                // handled by the Statement below.
-            }
-
+            // BEGIN IMMEDIATE acquires a write lock immediately so no other
+            // writer can slip in between our SELECT and UPDATE.
             try (java.sql.Statement st = conn.createStatement()) {
                 st.execute("BEGIN IMMEDIATE");
             } catch (SQLException e) {
-                // Already in a transaction; proceed.
+                // Already in a transaction on this connection; proceed.
             }
 
             try {
@@ -67,19 +67,20 @@ public class AgentPolicyEngine {
                     try (ResultSet rs = sel.executeQuery()) {
                         if (!rs.next()) {
                             conn.rollback();
-                            return new PolicyResult(false, "Agent not found after insert – internal error");
+                            return new PolicyResult(false, "Agent record missing after insert – internal error.");
                         }
 
-                        int allowed = rs.getInt("allowed");
-                        long limitPaise = rs.getLong("daily_limit_paise");
-                        long spentPaise = rs.getLong("daily_spent_paise");
-                        String lastReset = rs.getString("last_reset_date");
+                        int    allowed     = rs.getInt("allowed");
+                        long   limitPaise  = rs.getLong("daily_limit_paise");
+                        long   spentPaise  = rs.getLong("daily_spent_paise");
+                        String lastReset   = rs.getString("last_reset_date");
 
                         if (allowed == 0) {
                             conn.rollback();
-                            return new PolicyResult(false, "Agent is on the deny list");
+                            return new PolicyResult(false, "Agent is on the deny list.");
                         }
 
+                        // Reset daily counter when the calendar date has changed.
                         if (!today.equals(lastReset)) {
                             spentPaise = 0;
                         }
@@ -87,11 +88,12 @@ public class AgentPolicyEngine {
                         if (spentPaise + amountPaise > limitPaise) {
                             conn.rollback();
                             return new PolicyResult(false,
-                                String.format("Daily budget exceeded: spent=%d limit=%d requested=%d (paise)",
+                                String.format("Daily budget exceeded: spent=%d limit=%d requested=%d paise.",
                                     spentPaise, limitPaise, amountPaise));
                         }
 
                         long newSpent = spentPaise + amountPaise;
+
                         try (PreparedStatement upd = conn.prepareStatement(
                             "UPDATE agent_policy " +
                             "SET daily_spent_paise = ?, last_reset_date = ? " +
@@ -105,7 +107,7 @@ public class AgentPolicyEngine {
 
                         conn.commit();
                         return new PolicyResult(true,
-                            String.format("Approved. Spent today: %d / %d paise", newSpent, limitPaise));
+                            String.format("Approved. Spent today: %d / %d paise.", newSpent, limitPaise));
                     }
                 }
             } catch (SQLException e) {
@@ -118,8 +120,9 @@ public class AgentPolicyEngine {
     }
 
     /**
-     * Reverses a previously debited amount, e.g. when a payment subsequently
-     * fails and the reservation must be released.
+     * Reverses a debit, e.g. when a payment that was optimistically debited
+     * subsequently fails verification.  Uses MAX(0, ...) to guard against
+     * underflow in case of any accounting inconsistency.
      */
     public static void refundDebit(String agentId, long amountPaise) {
         try (Connection conn = AgentDatabase.getConnection()) {
@@ -147,19 +150,16 @@ public class AgentPolicyEngine {
     }
 
     /**
-     * Explicitly add or update an agent's policy record.
-     *
-     * @param agentId         identifier
-     * @param allowed         true to allow, false to block
-     * @param dailyLimitPaise maximum daily spend in paise
+     * Creates or updates a policy record for the given agent.
+     * Use this in an admin tool or integration test setup to explicitly
+     * allow/block an agent or raise their spending limit.
      */
     public static void upsertPolicy(String agentId, boolean allowed, long dailyLimitPaise) {
         try (Connection conn = AgentDatabase.getConnection();
              PreparedStatement ps = conn.prepareStatement(
-                 "INSERT INTO agent_policy(agent_id, allowed, daily_limit_paise, " +
-                 "daily_spent_paise, last_reset_date) VALUES (?, ?, ?, 0, date('now')) " +
-                 "ON CONFLICT(agent_id) DO UPDATE SET allowed=excluded.allowed, " +
-                 "daily_limit_paise=excluded.daily_limit_paise"
+                 "INSERT INTO agent_policy(agent_id, allowed, daily_limit_paise, daily_spent_paise, last_reset_date)" +
+                 " VALUES (?, ?, ?, 0, date('now'))" +
+                 " ON CONFLICT(agent_id) DO UPDATE SET allowed=excluded.allowed, daily_limit_paise=excluded.daily_limit_paise"
              )) {
             ps.setString(1, agentId);
             ps.setInt(2, allowed ? 1 : 0);
