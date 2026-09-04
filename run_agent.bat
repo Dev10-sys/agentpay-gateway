@@ -6,7 +6,13 @@ if "%RAZORPAY_KEY_ID%"=="" (
     exit /b 1
 )
 set PY_EXE=python
-if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
-    set PY_EXE="%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+where python >nul 2>nul
+if %ERRORLEVEL% neq 0 (
+    where py >nul 2>nul
+    if %ERRORLEVEL% equ 0 (
+        set PY_EXE=py
+    ) else if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
+        set PY_EXE="%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+    )
 )
 %PY_EXE% -u ai_agent.py --key %RAZORPAY_KEY_ID% %*

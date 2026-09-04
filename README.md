@@ -148,34 +148,42 @@ Validates `X-Razorpay-Signature`. Deduplication uses official `X-Razorpay-Event-
 
 ---
 
-## Budget & Policy Engine
+---
 
-```
-available = daily_limit - daily_spent - reserved_paise
-```
+## Dual-Layer Budget Architecture
 
-- **Reserve at challenge time** — budget is held in DB before creating the Razorpay order. Agents exceeding limits are rejected before payment.
-- **Commit on capture** — held funds transfer from `reserved_paise` to `daily_spent_paise` upon successful payment verification.
-- **Lazy expiry purging** — unconsumed reservations older than 15 minutes are purged in an atomic transaction during challenge issuance, releasing held budget.
-- **Atomic metering** — meter ticks and daily budget consumption commit together; pending settlement orders do not drain budget.
-- **Midnight reset** — resets in-memory caps and persists `daily_spent_paise = 0` in SQLite on the first request of each new calendar day.
-- **Concurrency control** — serialized SQLite transactions prevent parallel over-allocation.
+AgentPay intentionally separates client-side economic planning from server-side policy enforcement:
+
+1. **Client-Side Autonomous Budget (`ai_agent.py`)**:
+   - Acts as the agent's internal cognitive constraint.
+   - Evaluates task ROI and economic utility before agreeing to pay an HTTP 402 challenge.
+   - Tracks `budget_paise` and `spent_paise` to decide when to stop or prioritize queries.
+
+2. **Server-Side Hard Policy Enforcement (`AgentPolicyEngine`)**:
+   - Non-bypassable security gateway implemented on the merchant side.
+   - Formula: `available = daily_limit_paise - daily_spent_paise - reserved_paise`.
+   - **Reserve at challenge time** — budget is held in DB before creating the Razorpay order. Agents exceeding limits are rejected before payment.
+   - **Commit on capture** — held funds transfer from `reserved_paise` to `daily_spent_paise` upon successful payment verification.
+   - **Lazy expiry purging** — unconsumed reservations older than 15 minutes are purged in an atomic transaction during challenge issuance, releasing held budget.
+   - **Atomic micro-metering** — meter ticks and daily budget consumption commit together in a single ACID transaction; pending settlement orders do not drain budget.
+   - **Midnight reset** — resets in-memory caps and persists `daily_spent_paise = 0` in SQLite on the first request of each new calendar day.
+   - **Concurrency control** — serialized SQLite transactions prevent parallel over-allocation.
 
 ---
 
 ## Security Model
 
-| Guarantee | Mechanism |
-|---|---|
-| Budget reservation before payment | `AgentPolicyEngine.reserve()` + `reserved_paise` column |
-| Atomic double-spend prevention | `UPDATE ... WHERE status='PENDING'` inside single transaction |
-| Proof bound to exact resource + agent | `payment_challenge` table + live order notes check |
-| Strict amount verification | `payment.amount == order.amount == RESOURCE_PRICE_PAISE` |
-| Replay protection | Partial unique index on `audit_log` (VERIFIED rows only) |
-| Abandoned reservation release | Atomic `purgeExpiredChallenges()` on challenge creation |
-| Atomic micro-metering | Single-transaction ledger update + budget debit |
-| Webhook idempotency | `X-Razorpay-Event-Id` + `payment_event` table; HTTP 500 on DB error |
-| Input validation | Server-side tick/threshold bounds & receipt-length bounding |
+| Guarantee | Mechanism | Scope |
+|---|---|---|
+| Atomic Challenge Settlement | `UPDATE payment_challenge SET status='CONSUMED' WHERE order_id=? AND status='PENDING'` | Prevents double-spend and concurrent replay |
+| Pre-Flight Budget Hold | `reserve()` + `reserved_paise` column | Blocks checkout if daily limit exhausted |
+| Cryptographic Identity Binding | Live Razorpay Order `notes` verification | Prevents cross-agent or cross-resource reuse |
+| Strict Financial Consistency | `payment.amount == order.amount == RESOURCE_PRICE_PAISE` | Guarantees exact INR captured matches price |
+| Replay Protection | Partial unique index on `audit_log` (`WHERE decision='VERIFIED'`) | Blocks re-submission of already-verified proof |
+| Lazy Expiry Cleanup | Atomic `purgeExpiredChallenges()` during challenge creation | Prevents unfulfilled 402 holds from locking budget |
+| Atomic Micro-Metering | Single-transaction ledger write + budget debit | Prevents accounting drift and repeated drain |
+| Webhook Idempotency | `X-Razorpay-Event-Id` + `payment_event` table; HTTP 500 on DB error | Deduplicates retries without event loss |
+| Request Guardrails | Server-side tick/threshold bounds & 40-character receipt limits | Prevents malformed or overflowing inputs |
 
 ---
 

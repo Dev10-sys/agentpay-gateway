@@ -264,18 +264,8 @@ public class AgentGatewayResource {
                     return err(409, "Order already consumed or not found. Replay rejected.");
                 }
 
-                // Move reserved → spent.
-                try (PreparedStatement upd = conn.prepareStatement(
-                    "UPDATE agent_policy " +
-                    "SET daily_spent_paise=daily_spent_paise+?," +
-                    "    reserved_paise=MAX(0,reserved_paise-?) " +
-                    "WHERE agent_id=?"
-                )) {
-                    upd.setLong(1, capturedPaise);
-                    upd.setLong(2, capturedPaise);
-                    upd.setString(3, agentId);
-                    upd.executeUpdate();
-                }
+                // Move reserved → spent via canonical PolicyEngine method.
+                AgentPolicyEngine.commitReservation(conn, agentId, capturedPaise);
 
                 conn.commit();
 

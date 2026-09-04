@@ -130,9 +130,13 @@ public class AgentDatabase {
                 "WHERE razorpay_payment_id IS NOT NULL AND decision = 'VERIFIED'"
             );
 
-            // Schema upgrade for existing DBs.
+            // Schema retrofitting for existing DBs.
             addColumnIfMissing(st, "agent_policy", "reserved_paise", "BIGINT NOT NULL DEFAULT 0");
+            addColumnIfMissing(st, "agent_policy", "last_reset_date", "TEXT NOT NULL DEFAULT (date('now'))");
             addColumnIfMissing(st, "payment_event", "event_id", "TEXT");
+            addColumnIfMissing(st, "payment_challenge", "status", "TEXT NOT NULL DEFAULT 'PENDING'");
+            addColumnIfMissing(st, "payment_challenge", "amount_paise", "BIGINT NOT NULL DEFAULT 100");
+            addColumnIfMissing(st, "usage_ledger", "pending_order_id", "TEXT");
 
             System.out.println("[AgentDatabase] schema ready");
 

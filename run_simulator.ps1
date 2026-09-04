@@ -3,7 +3,11 @@ if (-not $env:RAZORPAY_KEY_ID) {
     Write-Error "Set RAZORPAY_KEY_ID before running. Example: `$env:RAZORPAY_KEY_ID='rzp_test_xxx'"
     exit 1
 }
-$pyExe = if (Test-Path "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe") {
+$pyExe = if (Get-Command python -ErrorAction SilentlyContinue) {
+    "python"
+} elseif (Get-Command py -ErrorAction SilentlyContinue) {
+    "py"
+} elseif (Test-Path "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe") {
     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
 } else {
     "python"

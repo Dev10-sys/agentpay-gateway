@@ -90,22 +90,30 @@ public class AgentPolicyEngine {
         }
     }
 
-    // Called after payment is confirmed captured — converts reservation to actual spend.
+    // Called after payment is confirmed captured — converts reservation to actual spend inside an existing transaction.
+    public static void commitReservation(Connection conn, String agentId, long amountPaise) throws SQLException {
+        if (amountPaise <= 0) return;
+        try (PreparedStatement upd = conn.prepareStatement(
+            "UPDATE agent_policy " +
+            "SET daily_spent_paise=daily_spent_paise+?," +
+            "    reserved_paise=MAX(0,reserved_paise-?) " +
+            "WHERE agent_id=?"
+        )) {
+            upd.setLong(1, amountPaise);
+            upd.setLong(2, amountPaise);
+            upd.setString(3, agentId);
+            upd.executeUpdate();
+        }
+    }
+
+    // Standalone commit reservation with its own transaction.
     public static PolicyResult commitReservation(String agentId, long amountPaise) {
         if (amountPaise <= 0) return new PolicyResult(false, "Amount must be positive.");
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
             beginImmediate(conn);
-            try (PreparedStatement upd = conn.prepareStatement(
-                "UPDATE agent_policy " +
-                "SET daily_spent_paise=daily_spent_paise+?," +
-                "    reserved_paise=MAX(0,reserved_paise-?) " +
-                "WHERE agent_id=?"
-            )) {
-                upd.setLong(1, amountPaise);
-                upd.setLong(2, amountPaise);
-                upd.setString(3, agentId);
-                upd.executeUpdate();
+            try {
+                commitReservation(conn, agentId, amountPaise);
                 conn.commit();
                 return new PolicyResult(true, "Reservation committed.");
             } catch (SQLException e) {
@@ -216,9 +224,15 @@ public class AgentPolicyEngine {
         }
     }
 
-    private static void beginImmediate(Connection conn) {
+    private static void beginImmediate(Connection conn) throws SQLException {
         try (java.sql.Statement st = conn.createStatement()) { st.execute("BEGIN IMMEDIATE"); }
-        catch (SQLException ignored) {}
+        catch (SQLException e) {
+            String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+            // In SQLite JDBC, setAutoCommit(false) starts a transaction; ignore only that specific state
+            if (!msg.contains("cannot start a transaction within a transaction")) {
+                throw e;
+            }
+        }
     }
 
     private static void rollback(Connection conn) {
