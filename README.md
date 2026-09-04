@@ -1,5 +1,7 @@
 # AgentPay Gateway
 
+[![CI](https://github.com/Dev10-sys/agentpay-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Dev10-sys/agentpay-gateway/actions)
+
 > **Razorpay Buildathon 2026 · Track 1 — AI Growth and Agentic Commerce**
 
 AgentPay is a Razorpay-native machine-payment gateway that applies x402-style HTTP payment discovery to INR payments, with agent-level policy enforcement, auditable spending, and fiat-aware usage aggregation.
@@ -42,7 +44,7 @@ AI Agent (agent_simulator.py / ai_agent.py)
 
 | File | Purpose |
 |---|---|
-| `AgentDatabase.java` | SQLite schema bootstrap (4 tables + payment_event) |
+| `AgentDatabase.java` | SQLite schema bootstrap (5 core tables) |
 | `AgentPolicyEngine.java` | Per-agent daily cap: `reserve → commit → release` lifecycle |
 | `AuditLog.java` | Append-only decision log with VERIFIED-only partial unique index |
 | `AgentGatewayResource.java` | x402-style gateway — `/agent/resource/{id}` |
@@ -166,7 +168,7 @@ AgentPay intentionally separates client-side economic planning from server-side 
    - **Commit on capture** — held funds transfer from `reserved_paise` to `daily_spent_paise` upon successful payment verification.
    - **Lazy expiry purging** — unconsumed reservations older than 15 minutes are purged in an atomic transaction during challenge issuance, releasing held budget.
    - **Atomic micro-metering** — meter ticks and daily budget consumption commit together in a single ACID transaction; pending settlement orders do not drain budget.
-   - **Midnight reset** — resets in-memory caps and persists `daily_spent_paise = 0` in SQLite on the first request of each new calendar day.
+   - **Midnight reset** — resets daily spend and persists `daily_spent_paise = 0` in SQLite on the first request of each new calendar day.
    - **Concurrency control** — serialized SQLite transactions prevent parallel over-allocation.
 
 ---

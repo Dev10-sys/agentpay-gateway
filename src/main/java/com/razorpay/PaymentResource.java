@@ -30,7 +30,7 @@ public class PaymentResource {
     try {
       this.client = new RazorpayClient(this.apiKey, this.secretKey);
     } catch (RazorpayException e) {
-      // TODO Auto-generated catch block
+      System.err.println("[PaymentResource] Failed to initialize RazorpayClient: " + e.getMessage());
       e.printStackTrace();
     }
     

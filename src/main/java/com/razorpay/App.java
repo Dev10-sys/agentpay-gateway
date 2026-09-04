@@ -37,7 +37,7 @@ public class App extends Application<AppConfiguration> {
             );
         }
 
-        System.out.println("[AgentPay] key=" + apiKey);
+        System.out.println("[AgentPay] Razorpay client initialized");
 
         AgentDatabase.setDbPath(cfg.getDbPath());
         AgentDatabase.initialize();

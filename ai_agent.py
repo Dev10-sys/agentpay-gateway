@@ -73,12 +73,12 @@ class AgentBrain:
     """
     Cognitive decision engine for the AI buyer.
     Supports two operating modes:
-      1. Live LLM Mode (OpenAI GPT-4o / Gemini 1.5):
-         Uses real LLM tool-calling and reasoning when an API key is provided
+      1. Live LLM Mode (OpenAI / Google Gemini):
+         Uses an LLM-guided tool-use and reasoning loop when an API key is provided
          via OPENAI_API_KEY, GEMINI_API_KEY, or command-line flags.
       2. Deterministic Heuristic Engine (Zero-cost Mode):
-         Uses bounded utility-maximization rules mimicking LLM function calling
-         for predictable, offline testing and demonstrations.
+         Uses bounded utility-maximization rules for deterministic tool planning
+         and predictable offline testing.
     """
 
     def __init__(self, task: str, budget_paise: int, agent_id: str,
@@ -298,7 +298,7 @@ new Razorpay({{
     key:"{KEY_ID}",amount:"{amount_paise}",currency:"INR",
     name:"AgentPay Gateway",description:"Agent access: {resource_id}",
     order_id:"{order_id}",
-    prefill:{{name:"AI Agent",email:"agent@agentpay.dev",contact:"+918077907751"}},
+    prefill:{{name:"AI Agent",email:"agent@agentpay.dev",contact:"+919999999999"}},
     handler:function(r){{document.getElementById('r').textContent=JSON.stringify(r);window._done=r;}},
     modal:{{ondismiss:function(){{window._done='dismissed';}}}},
     theme:{{color:"#6366f1"}}
@@ -350,7 +350,7 @@ new Razorpay({{
                     function set(el,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,v);
                     el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}
                     for(var i of document.querySelectorAll('input')){var p=i.placeholder||'';
-                    if(p.toLowerCase().includes('mobile')||p.toLowerCase().includes('phone')){set(i,'8077907751');break;}}
+                    if(p.toLowerCase().includes('mobile')||p.toLowerCase().includes('phone')){set(i,'9999999999');break;}}
                     for(var b of document.querySelectorAll('button')) if(b.textContent.trim()==='Continue'){b.click();return;}
                 }""")
                 page.wait_for_timeout(1500)
@@ -478,12 +478,14 @@ def run_agent(task: str, budget_paise: int, agent_id: str, skip_meter: bool,
         section(f"Step 3 — Metered usage on '{primary}'")
         log("📊", "Sending 5 usage ticks (50p each) to demonstrate metering...")
         for i in range(5):
-            tick_result = tool_meter_tick(agent_id, primary)
+            tick_amount = 50
+            tick_result = tool_meter_tick(agent_id, primary, tick_paise=tick_amount)
             sc   = tick_result["status_code"]
             body = tick_result["body"]
             if sc == 200:
                 acc = body.get("accumulated_paise", 0)
-                log("↗️", f"Tick {i+1}: ₹{acc/100:.2f} accumulated", indent=1)
+                brain.spent_paise += tick_amount
+                log("↗️", f"Tick {i+1}: ₹{acc/100:.2f} accumulated | Added to spend: ₹{tick_amount/100:.2f} (Total: ₹{brain.spent_paise/100:.2f})", indent=1)
             elif sc == 402:
                 log("📦", f"Threshold reached — settlement required.", indent=1)
                 break

@@ -90,7 +90,7 @@ var rzp = new Razorpay({{
     name:        "AgentPay Gateway",
     description: "Unlock {order_id}",
     order_id:    "{order_id}",
-    prefill: {{ name:"Test Agent", email:"agent@agentpay.dev", contact:"+918077907751" }},
+    prefill: {{ name:"Test Agent", email:"agent@agentpay.dev", contact:"+919999999999" }},
     handler:     function(r){{ document.getElementById('r').textContent=JSON.stringify(r); window._done=r; }},
     modal:       {{ ondismiss: function(){{ window._done='dismissed'; }} }},
     theme:       {{ color:"#6366f1" }}
@@ -154,7 +154,7 @@ rzp.open();
                     for (var i of document.querySelectorAll('input')) {
                         var p = i.placeholder||'';
                         if(p.toLowerCase().includes('mobile')||p.toLowerCase().includes('phone')){
-                            set(i,'8077907751'); break;
+                            set(i,'9999999999'); break;
                         }
                     }
                     for (var b of document.querySelectorAll('button'))
