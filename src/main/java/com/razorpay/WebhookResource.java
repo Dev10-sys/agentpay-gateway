@@ -39,7 +39,10 @@ public class WebhookResource {
 
     @POST
     @Path("/razorpay")
-    public Response handle(@HeaderParam("X-Razorpay-Signature") String sig, String body) {
+    public Response handle(
+            @HeaderParam("X-Razorpay-Signature") String sig,
+            @HeaderParam("X-Razorpay-Event-Id")  String eventId,
+            String body) {
         if (webhookSecret == null || webhookSecret.isEmpty())
             return err(503, "Webhook secret not configured.");
         if (sig == null || sig.isEmpty())
@@ -55,13 +58,13 @@ public class WebhookResource {
         catch (Exception e) { return err(400, "Body is not valid JSON."); }
 
         String type = event.optString("event", "");
-        if ("payment.captured".equals(type)) return onPaymentCaptured(event);
+        if ("payment.captured".equals(type)) return onPaymentCaptured(event, eventId);
 
         return Response.ok(new JSONObject()
             .put("status", "ignored").put("event", type).toString()).build();
     }
 
-    private Response onPaymentCaptured(JSONObject event) {
+    private Response onPaymentCaptured(JSONObject event, String eventId) {
         String paymentId, orderId;
         long   amount;
         try {
@@ -75,23 +78,31 @@ public class WebhookResource {
             return err(400, "Malformed payload: " + e.getMessage());
         }
 
-        // Deduplicate: returns false if this (event_type, payment_id) was already seen.
-        boolean isNew = AgentDatabase.recordWebhookEvent("payment.captured", paymentId, orderId);
-        if (!isNew) {
+        // Deduplicate using official event_id and (event_type, payment_id)
+        AgentDatabase.WebhookRecordResult recResult =
+            AgentDatabase.recordWebhookEvent(eventId, "payment.captured", paymentId, orderId);
+
+        if (recResult == AgentDatabase.WebhookRecordResult.ERROR) {
+            return err(500, "Internal database error processing webhook event.");
+        }
+
+        if (recResult == AgentDatabase.WebhookRecordResult.DUPLICATE) {
             return Response.ok(new JSONObject()
                 .put("status",     "duplicate")
                 .put("payment_id", paymentId)
+                .put("event_id",   eventId)
                 .put("message",    "Event already processed.")
                 .toString()).build();
         }
 
         // Log the event — DECISION_WEBHOOK keeps this row out of the replay-protection index.
         AuditLog.record("webhook", null, amount, AuditLog.DECISION_WEBHOOK,
-                "payment.captured received", orderId, null);
+                "payment.captured received" + (eventId != null ? " [evt=" + eventId + "]" : ""), orderId, null);
 
         return Response.ok(new JSONObject()
             .put("status",       "acknowledged")
             .put("payment_id",   paymentId)
+            .put("event_id",     eventId)
             .put("amount_paise", amount)
             .toString()).build();
     }

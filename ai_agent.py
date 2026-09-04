@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 import textwrap
@@ -37,8 +38,6 @@ SERVER  = "http://localhost:8080"
 KEY_ID  = ""
 
 # ── Resource catalog ──────────────────────────────────────────────────────────
-# In production, this comes from a service discovery endpoint.
-# Here we define the resources the agent knows about.
 RESOURCE_CATALOG = {
     "market-data-v1": {
         "description": "Real-time market prices (BTC/INR, ETH/INR, equity indices)",
@@ -72,12 +71,18 @@ def section(title):
 
 class AgentBrain:
     """
-    Minimal rule-based reasoning loop that mimics tool-use agent behavior.
-    Can be extended to call an actual LLM (Gemini, GPT-4, Claude) by replacing
-    the plan() and decide_to_pay() methods with API calls.
+    Cognitive decision engine for the AI buyer.
+    Supports two operating modes:
+      1. Live LLM Mode (OpenAI GPT-4o / Gemini 1.5):
+         Uses real LLM tool-calling and reasoning when an API key is provided
+         via OPENAI_API_KEY, GEMINI_API_KEY, or command-line flags.
+      2. Deterministic Heuristic Engine (Zero-cost Mode):
+         Uses bounded utility-maximization rules mimicking LLM function calling
+         for predictable, offline testing and demonstrations.
     """
 
-    def __init__(self, task: str, budget_paise: int, agent_id: str):
+    def __init__(self, task: str, budget_paise: int, agent_id: str,
+                 llm_provider: str = "auto", llm_key: str = None, model: str = None):
         self.task          = task
         self.budget_paise  = budget_paise
         self.spent_paise   = 0
@@ -85,12 +90,87 @@ class AgentBrain:
         self.memory        = []   # accumulated results
         self.reasoning_log = []   # decision trace
 
+        # Detect LLM provider & credentials
+        self.llm_provider = llm_provider
+        self.llm_key      = llm_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        self.model        = model
+
+        if self.llm_provider == "auto":
+            if os.environ.get("OPENAI_API_KEY") or (self.llm_key and self.llm_key.startswith("sk-")):
+                self.llm_provider = "openai"
+            elif os.environ.get("GEMINI_API_KEY") or (self.llm_key and self.llm_key.startswith("AIza")):
+                self.llm_provider = "gemini"
+            else:
+                self.llm_provider = "heuristic"
+
+        if self.llm_provider == "openai" and not self.model:
+            self.model = "gpt-4o-mini"
+        elif self.llm_provider == "gemini" and not self.model:
+            self.model = "gemini-1.5-flash"
+
+        if self.llm_provider in ("openai", "gemini") and self.llm_key:
+            self._think(f"Brain online: Live {self.llm_provider.upper()} Engine ({self.model})")
+        else:
+            self.llm_provider = "heuristic"
+            self._think("Brain online: Heuristic Engine (Tip: set OPENAI_API_KEY or GEMINI_API_KEY for live LLM mode)")
+
     @property
     def remaining_paise(self):
         return self.budget_paise - self.spent_paise
 
+    def _call_openai(self, prompt: str, system: str = "You are an autonomous AI economic procurement agent.") -> str:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.llm_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    def _call_gemini(self, prompt: str, system: str = "") -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.llm_key}"
+        payload = {
+            "contents": [{"parts": [{"text": (system + "\n\n" + prompt).strip()}]}]
+        }
+        resp = requests.post(url, json=payload, timeout=20)
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
     def plan(self) -> list:
         """Return an ordered list of resource IDs relevant to the task."""
+        if self.llm_provider in ("openai", "gemini") and self.llm_key:
+            try:
+                catalog_desc = "\n".join([f"- {k}: {v['description']}" for k, v in RESOURCE_CATALOG.items()])
+                prompt = (
+                    f"You have the goal: '{self.task}'.\n"
+                    f"Available merchant resources:\n{catalog_desc}\n\n"
+                    "Which resource IDs are required to accomplish this goal? "
+                    "Return ONLY a JSON array of valid resource IDs, e.g. [\"market-data-v1\"]."
+                )
+                raw = self._call_openai(prompt) if self.llm_provider == "openai" else self._call_gemini(prompt)
+                clean = raw.strip()
+                if "```" in clean:
+                    clean = clean.split("```")[1]
+                    if clean.startswith("json"): clean = clean[4:]
+                plan = json.loads(clean.strip())
+                if isinstance(plan, list) and plan:
+                    valid = [r for r in plan if r in RESOURCE_CATALOG]
+                    if valid:
+                        self._think(f"LLM Plan: {valid} selected to solve '{self.task}'")
+                        return valid
+            except Exception as e:
+                self._think(f"LLM plan error ({e}) — falling back to heuristic planner")
+
+        # Heuristic fallback
         task_lower = self.task.lower()
         ranked = []
         for rid, meta in RESOURCE_CATALOG.items():
@@ -112,11 +192,35 @@ class AgentBrain:
         budget = self.remaining_paise
 
         if amount_paise > budget:
-            reason = f"Price {amount_paise}p > remaining budget {budget}p. Skipping."
+            reason = f"Price ₹{amount_paise/100:.2f} exceeds remaining budget of ₹{budget/100:.2f}. Hard stop."
             self._think(reason)
             return False, reason
 
-        # Utility: pay if value-to-cost ratio is acceptable (≥1 INR per value point).
+        if self.llm_provider in ("openai", "gemini") and self.llm_key:
+            try:
+                prompt = (
+                    f"You are an autonomous AI buyer encountering an HTTP 402 payment challenge.\n"
+                    f"Goal: '{self.task}'\n"
+                    f"Resource: '{resource_id}' ({meta.get('description', '')})\n"
+                    f"Price: ₹{amount_paise/100:.2f} ({amount_paise} paise)\n"
+                    f"Remaining budget: ₹{budget/100:.2f} ({budget} paise)\n"
+                    f"Should you authorize this transaction? Respond ONLY in valid JSON: "
+                    f"{{\"pay\": true, \"reason\": \"<short reason>\"}}"
+                )
+                raw = self._call_openai(prompt) if self.llm_provider == "openai" else self._call_gemini(prompt)
+                clean = raw.strip()
+                if "```" in clean:
+                    clean = clean.split("```")[1]
+                    if clean.startswith("json"): clean = clean[4:]
+                decision = json.loads(clean.strip())
+                should_pay = bool(decision.get("pay", True))
+                reason = f"LLM Decision: {decision.get('reason', 'Authorized by model.')}"
+                self._think(reason)
+                return should_pay, reason
+            except Exception as e:
+                self._think(f"LLM decision error ({e}) — using heuristic budget policy")
+
+        # Heuristic ratio check
         ratio  = value / (amount_paise / 100) if amount_paise > 0 else 0
         if ratio >= 0.5:
             reason = f"Value score {value}, price ₹{amount_paise/100:.2f}, ratio {ratio:.1f}. Worth paying."
@@ -135,6 +239,20 @@ class AgentBrain:
         """Produce a final answer from accumulated memory."""
         if not self.memory:
             return "No resources accessed — task could not be completed within budget."
+
+        if self.llm_provider in ("openai", "gemini") and self.llm_key:
+            try:
+                prompt = (
+                    f"You are an AI financial analyst reporting on the completed goal: '{self.task}'.\n"
+                    f"Budget used: ₹{self.spent_paise/100:.2f}.\n"
+                    f"Data collected from paid merchant resources:\n{json.dumps(self.memory, indent=2)}\n\n"
+                    "Provide a crisp, professional analytical report with actionable insights."
+                )
+                res = self._call_openai(prompt) if self.llm_provider == "openai" else self._call_gemini(prompt)
+                return f"Task: {self.task}\nBudget spent: ₹{self.spent_paise/100:.2f} | Engine: {self.llm_provider.upper()} ({self.model})\n\n" + res.strip()
+            except Exception as e:
+                self._think(f"LLM synthesis error ({e}) — using structured summary")
+
         parts = [f"Task: {self.task}", f"Budget used: ₹{self.spent_paise/100:.2f}", ""]
         for entry in self.memory:
             rid  = entry["resource"]
@@ -302,13 +420,15 @@ def proof_amount(proof, response):
 
 # ── Main agent loop ────────────────────────────────────────────────────────────
 
-def run_agent(task: str, budget_paise: int, agent_id: str, skip_meter: bool):
-    brain = AgentBrain(task, budget_paise, agent_id)
+def run_agent(task: str, budget_paise: int, agent_id: str, skip_meter: bool,
+              llm_provider: str = "auto", llm_key: str = None, model: str = None):
+    brain = AgentBrain(task, budget_paise, agent_id, llm_provider, llm_key, model)
 
     section(f"AgentPay — AI Agent Starting")
     log("🎯", f"Task   : {task}")
     log("💰", f"Budget : ₹{budget_paise/100:.2f}")
     log("🤖", f"Agent  : {agent_id}")
+    log("🧠", f"Engine : {brain.llm_provider.upper()} ({brain.model or 'heuristic'})")
 
     # Step 1: Plan which resources are needed.
     section("Step 1 — Planning")
@@ -391,12 +511,17 @@ def main():
     p.add_argument("--agent",      default="ai-agent-001")
     p.add_argument("--server",     default="http://localhost:8080")
     p.add_argument("--skip-meter", action="store_true")
+    p.add_argument("--llm",        choices=["auto", "openai", "gemini", "heuristic"], default="auto",
+                   help="Brain engine: auto (detects env var), openai, gemini, or heuristic")
+    p.add_argument("--llm-key",    help="API key for OpenAI or Gemini (or set OPENAI_API_KEY/GEMINI_API_KEY env var)")
+    p.add_argument("--model",      help="Model name (e.g. gpt-4o-mini, gemini-1.5-flash)")
     args = p.parse_args()
 
     SERVER = args.server
     KEY_ID = args.key
 
-    run_agent(args.task, args.budget, args.agent, args.skip_meter)
+    run_agent(args.task, args.budget, args.agent, args.skip_meter,
+              llm_provider=args.llm, llm_key=args.llm_key, model=args.model)
 
 
 if __name__ == "__main__":

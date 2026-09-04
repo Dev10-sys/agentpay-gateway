@@ -7,6 +7,7 @@ import org.junit.Test;
 import java.io.File;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 
 import static org.junit.Assert.*;
 
@@ -185,6 +186,91 @@ public class AgentPolicyEngineTest {
         // Budget should now be free again.
         AgentPolicyEngine.PolicyResult r = AgentPolicyEngine.reserve("agent-L", 200);
         assertTrue("After purge, agent should be able to reserve again", r.allowed);
+    }
+
+    // ---- midnight reset ---------------------------------------------------
+
+    @Test
+    public void midnightReset_resetsDailySpentInDatabase() throws Exception {
+        try (Connection conn = AgentDatabase.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO agent_policy(agent_id,allowed,daily_limit_paise,daily_spent_paise,reserved_paise,last_reset_date) " +
+                 "VALUES('agent-reset',1,500,450,0,date('now','-1 day'))"
+             )) {
+            ps.executeUpdate();
+        }
+
+        // Reserving 100 paise should succeed because yesterday's spent was 450 but today is a fresh day (limit 500)
+        AgentPolicyEngine.PolicyResult r = AgentPolicyEngine.reserve("agent-reset", 100);
+        assertTrue("Reservation on new day should succeed", r.allowed);
+
+        // Verify DB directly: daily_spent_paise MUST have been reset to 0 in SQLite
+        try (Connection conn = AgentDatabase.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT daily_spent_paise, reserved_paise FROM agent_policy WHERE agent_id='agent-reset'"
+             );
+             ResultSet rs = ps.executeQuery()) {
+            assertTrue(rs.next());
+            assertEquals("daily_spent_paise must be reset to 0 in DB on new day", 0, rs.getLong("daily_spent_paise"));
+            assertEquals("reserved_paise must be 100", 100, rs.getLong("reserved_paise"));
+        }
+
+        // Commit reservation and check spend is 100, not 450 + 100 = 550
+        AgentPolicyEngine.PolicyResult commitRes = AgentPolicyEngine.commitReservation("agent-reset", 100);
+        assertTrue(commitRes.allowed);
+
+        try (Connection conn = AgentDatabase.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT daily_spent_paise, reserved_paise FROM agent_policy WHERE agent_id='agent-reset'"
+             );
+             ResultSet rs = ps.executeQuery()) {
+            assertTrue(rs.next());
+            assertEquals("daily_spent_paise should now be 100", 100, rs.getLong("daily_spent_paise"));
+            assertEquals("reserved_paise should be 0", 0, rs.getLong("reserved_paise"));
+        }
+    }
+
+    // ---- transactional checkAndDebit ---------------------------------------
+
+    @Test
+    public void checkAndDebit_transactionalRollback_preservesBudget() throws Exception {
+        AgentPolicyEngine.upsertPolicy("agent-tx", true, 500);
+
+        try (Connection conn = AgentDatabase.getConnection()) {
+            conn.setAutoCommit(false);
+            AgentPolicyEngine.PolicyResult r = AgentPolicyEngine.checkAndDebit(conn, "agent-tx", 50);
+            assertTrue(r.allowed);
+            // Roll back transaction
+            conn.rollback();
+        }
+
+        // Verify budget was not debited
+        try (Connection conn = AgentDatabase.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT daily_spent_paise FROM agent_policy WHERE agent_id='agent-tx'"
+             );
+             ResultSet rs = ps.executeQuery()) {
+            assertTrue(rs.next());
+            assertEquals("Rollback must restore daily_spent_paise to 0", 0, rs.getLong("daily_spent_paise"));
+        }
+    }
+
+    // ---- webhook deduplication & event_id ----------------------------------
+
+    @Test
+    public void recordWebhookEvent_withEventId_distinguishesNewAndDuplicate() {
+        AgentDatabase.WebhookRecordResult r1 =
+            AgentDatabase.recordWebhookEvent("evt_test_100", "payment.captured", "pay_test_100", "order_test_100");
+        assertEquals("First delivery should be NEW", AgentDatabase.WebhookRecordResult.NEW, r1);
+
+        AgentDatabase.WebhookRecordResult r2 =
+            AgentDatabase.recordWebhookEvent("evt_test_100", "payment.captured", "pay_test_100", "order_test_100");
+        assertEquals("Second delivery with same event_id should be DUPLICATE", AgentDatabase.WebhookRecordResult.DUPLICATE, r2);
+
+        // Duplicate by payment_id without event_id
+        AgentDatabase.WebhookRecordResult r3 =
+            AgentDatabase.recordWebhookEvent(null, "payment.captured", "pay_test_100", "order_test_100");
+        assertEquals("Duplicate payment_id should be DUPLICATE", AgentDatabase.WebhookRecordResult.DUPLICATE, r3);
     }
 }
 

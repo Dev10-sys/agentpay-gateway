@@ -92,10 +92,19 @@ playwright install chromium
 | 4 | Replay the same proof → **HTTP 409 Conflict** |
 | 5 | Tick metering (50p × 10 = 500p threshold) → consolidated order → settle → ledger reset |
 
-### 4. Run the AI Agent Demo
+### 4. Run the Autonomous AI Agent (Track 1)
+
+`ai_agent.py` acts as an autonomous economic buyer navigating the 402 payment protocol:
+- **Live LLM Engine**: Uses OpenAI (GPT-4o) or Google Gemini for dynamic tool planning, economic utility evaluation, and analytical synthesis when an API key is provided.
+- **Zero-Cost Heuristic Engine**: Runs offline with deterministic utility-scoring rules for reproducible tests and demonstrations.
 
 ```powershell
-python ai_agent.py --key $env:RAZORPAY_KEY_ID --task "Fetch market data for BTC/INR"
+# Offline / Heuristic Mode
+.\run_agent.ps1 --task "Analyze market prices for BTC/INR"
+
+# Live LLM Reasoning Mode (OpenAI / Gemini)
+$env:OPENAI_API_KEY="sk-..."
+.\run_agent.ps1 --task "Assess portfolio risk and calculate VaR" --llm openai
 ```
 
 ---
@@ -131,39 +140,26 @@ python ai_agent.py --key $env:RAZORPAY_KEY_ID --task "Fetch market data for BTC/
 Body (optional, validated server-side): `{ "tick_paise": 50, "threshold_paise": 500 }`
 
 Returns `200` while accumulating, `402` with `razorpay_order_id` when threshold crossed.  
-Ledger resets **only** after payment is confirmed `captured` and the captured amount equals the accumulated balance.
+Both the daily budget debit and usage ledger update are executed within a single ACID transaction. If an unsettled order is pending, `402` is returned immediately without debiting the daily budget.
 
 ### `POST /webhook/razorpay`
 
-Validates `X-Razorpay-Signature`. Genuine idempotency: duplicate `payment.captured` deliveries are detected via `payment_event` table (UNIQUE on `event_type + payment_id`). Webhook events write `DECISION_WEBHOOK` — not `DECISION_VERIFIED` — so webhook delivery never causes a spurious 409 on the agent retry path.
+Validates `X-Razorpay-Signature`. Deduplication uses official `X-Razorpay-Event-Id` and `UNIQUE(event_type, payment_id)` in the `payment_event` table. Database errors return HTTP 500 to trigger Razorpay retries, while processed duplicates safely return HTTP 200. Webhook events write `DECISION_WEBHOOK` — never `DECISION_VERIFIED` — isolating webhooks from the replay protection index.
 
 ---
 
-## Budget / Policy Engine
+## Budget & Policy Engine
 
 ```
 available = daily_limit - daily_spent - reserved_paise
 ```
 
-- **Reserve at challenge time** — budget is held before the Razorpay order is created.  
-  An agent over its cap is rejected before any payment is attempted.
-- **Commit on capture** — held amount moves to `daily_spent` after payment confirmed.
-- **Release on expiry** — reservations from orders never paid are freed after 15 minutes.
-- Each meter tick debits the daily budget immediately, so accumulated unsettled usage counts toward the cap.
-- Day resets automatically on the first request after midnight.
-- Default daily limit: ₹500 (50 000 paise) per agent.
-- `BEGIN IMMEDIATE` transactions serialise concurrent budget mutations.
-
----
-
-## Usage Metering
-
-x402 on crypto allows sub-cent per-call charges because blockchain settlement is nearly free. INR bank rails have a practical minimum (~₹1). AgentPay solves this by accumulating small tick amounts in a server-side ledger and firing **one consolidated Razorpay order** only when the threshold is crossed.
-
-Settlement semantics:
-- Ledger resets to zero **only after** the consolidated order's payment is confirmed `captured`
-- Captured amount must exactly equal accumulated balance — partial payments are rejected
-- Settlement proof is validated the same way as gateway proof (HMAC + order notes binding)
+- **Reserve at challenge time** — budget is held in DB before creating the Razorpay order. Agents exceeding limits are rejected before payment.
+- **Commit on capture** — held funds transfer from `reserved_paise` to `daily_spent_paise` upon successful payment verification.
+- **Lazy expiry purging** — unconsumed reservations older than 15 minutes are purged in an atomic transaction during challenge issuance, releasing held budget.
+- **Atomic metering** — meter ticks and daily budget consumption commit together; pending settlement orders do not drain budget.
+- **Midnight reset** — resets in-memory caps and persists `daily_spent_paise = 0` in SQLite on the first request of each new calendar day.
+- **Concurrency control** — serialized SQLite transactions prevent parallel over-allocation.
 
 ---
 
@@ -171,13 +167,15 @@ Settlement semantics:
 
 | Guarantee | Mechanism |
 |---|---|
-| Budget reservation before payment | `reserve()` + `reserved_paise` column |
+| Budget reservation before payment | `AgentPolicyEngine.reserve()` + `reserved_paise` column |
+| Atomic double-spend prevention | `UPDATE ... WHERE status='PENDING'` inside single transaction |
 | Proof bound to exact resource + agent | `payment_challenge` table + live order notes check |
-| Atomic double-spend prevention | `UPDATE ... WHERE status='PENDING'` inside BEGIN IMMEDIATE |
+| Strict amount verification | `payment.amount == order.amount == RESOURCE_PRICE_PAISE` |
 | Replay protection | Partial unique index on `audit_log` (VERIFIED rows only) |
-| Abandoned reservation expiry | `purgeExpiredChallenges()` at challenge time |
-| Webhook idempotency | `payment_event` UNIQUE(event_type, payment_id) |
-| Input validation | tick/threshold bounds, negative amount rejection |
+| Abandoned reservation release | Atomic `purgeExpiredChallenges()` on challenge creation |
+| Atomic micro-metering | Single-transaction ledger update + budget debit |
+| Webhook idempotency | `X-Razorpay-Event-Id` + `payment_event` table; HTTP 500 on DB error |
+| Input validation | Server-side tick/threshold bounds & receipt-length bounding |
 
 ---
 
@@ -200,7 +198,11 @@ docker run -p 8080:8080 \
 mvn test
 ```
 
-15 focused unit tests across `AgentPolicyEngineTest` and `AuditLogTest`:
-- Policy: reservation success/failure, cap exhaustion, blocked agent, zero/negative input
-- Concurrency: simultaneous reservation against exact budget — only one wins
-- Audit: VERIFIED vs WEBHOOK isolation, duplicate-insert swallowed by index
+**21 focused state-machine and policy tests** across `AgentPolicyEngineTest` (16 tests) and `AuditLogTest` (5 tests):
+- **Policy lifecycle**: Reservation success/failure, cap exhaustion, blocked agent, zero/negative inputs.
+- **Atomic challenge settlement**: Single-winner guarantee on `atomicConsumeChallenge`, duplicate-consumption rejection (409).
+- **Midnight reset**: SQLite database verification confirming `daily_spent_paise` resets to 0 across day rollover.
+- **Atomic metering**: Transactional rollback test ensuring failed ledger writes roll back budget debits.
+- **Expiry cleanup**: Atomic challenge expiration and budget reservation release.
+- **Concurrency**: Parallel race-condition tests confirming single winner when budget equals exact request amount.
+- **Audit & Webhooks**: Replay prevention, VERIFIED vs WEBHOOK isolation, `X-Razorpay-Event-Id` duplicate handling.

@@ -242,6 +242,11 @@ public class AgentGatewayResource {
         }
 
         int capturedPaise = (int) payment.get("amount");
+        if (capturedPaise != orderAmount) {
+            AuditLog.record(agentId, resourceId, capturedPaise, AuditLog.DECISION_DENIED,
+                    "Amount mismatch: captured=" + capturedPaise + " order=" + orderAmount, orderId, paymentId);
+            return err(400, "Captured payment amount (" + capturedPaise + " paise) does not match order amount (" + orderAmount + " paise).");
+        }
 
         // Step 5: Atomic consume + commit inside one BEGIN IMMEDIATE transaction.
         try (Connection conn = AgentDatabase.getConnection()) {

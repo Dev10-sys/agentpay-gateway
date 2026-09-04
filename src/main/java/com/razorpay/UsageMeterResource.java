@@ -98,14 +98,6 @@ public class UsageMeterResource {
     private Response processTick(String agentId, String resourceId,
                                  long tickPaise, long thresholdPaise) {
 
-        // Fix #8: debit the actual tick amount — accumulated usage counts toward daily cap.
-        AgentPolicyEngine.PolicyResult policy = AgentPolicyEngine.checkAndDebit(agentId, tickPaise);
-        if (!policy.allowed) {
-            AuditLog.record(agentId, resourceId, tickPaise, AuditLog.DECISION_DENIED,
-                    "Policy denied: " + policy.reason, null, null);
-            return err(403, "Agent denied: " + policy.reason);
-        }
-
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
             beginImmediate(conn);
@@ -126,6 +118,7 @@ public class UsageMeterResource {
                         long   tick    = rs.getLong("tick_paise");
                         String pending = rs.getString("pending_order_id");
 
+                        // If settlement is pending, reject immediately with 402 WITHOUT debiting budget
                         if (!blank(pending)) {
                             conn.rollback();
                             return Response.status(402).entity(new JSONObject()
@@ -136,6 +129,15 @@ public class UsageMeterResource {
                                     "Settle the pending order first. " +
                                     "Retry with X-Razorpay-Payment-Id, X-Razorpay-Order-Id, X-Razorpay-Signature.")
                                 .toString()).build();
+                        }
+
+                        // Atomic budget check and debit inside THIS same transaction
+                        AgentPolicyEngine.PolicyResult policy = AgentPolicyEngine.checkAndDebit(conn, agentId, tickPaise);
+                        if (!policy.allowed) {
+                            conn.rollback();
+                            AuditLog.record(agentId, resourceId, tickPaise, AuditLog.DECISION_DENIED,
+                                    "Policy denied: " + policy.reason, null, null);
+                            return err(403, "Agent denied: " + policy.reason);
                         }
 
                         long newAcc = acc + tick;

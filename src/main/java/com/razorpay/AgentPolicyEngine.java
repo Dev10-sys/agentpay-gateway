@@ -56,7 +56,8 @@ public class AgentPolicyEngine {
                         long reserved = rs.getLong("reserved_paise");
                         String last   = rs.getString("last_reset_date");
 
-                        if (!today.equals(last)) spent = 0; // new day
+                        boolean isNewDay = !today.equals(last);
+                        if (isNewDay) spent = 0; // new day
 
                         long available = limit - spent - reserved;
                         if (available < amountPaise) {
@@ -67,7 +68,9 @@ public class AgentPolicyEngine {
                         }
 
                         try (PreparedStatement upd = conn.prepareStatement(
-                            "UPDATE agent_policy SET reserved_paise=reserved_paise+?,last_reset_date=? WHERE agent_id=?"
+                            isNewDay
+                                ? "UPDATE agent_policy SET daily_spent_paise=0,reserved_paise=reserved_paise+?,last_reset_date=? WHERE agent_id=?"
+                                : "UPDATE agent_policy SET reserved_paise=reserved_paise+?,last_reset_date=? WHERE agent_id=?"
                         )) {
                             upd.setLong(1, amountPaise);
                             upd.setString(2, today);
@@ -135,54 +138,60 @@ public class AgentPolicyEngine {
     }
 
     // Direct debit used by the metering flow (no reservation step needed there).
+    public static PolicyResult checkAndDebit(Connection conn, String agentId, long amountPaise) throws SQLException {
+        if (amountPaise < 0) return new PolicyResult(false, "Amount cannot be negative.");
+        AgentDatabase.insertDefaultPolicy(conn, agentId);
+        String today = LocalDate.now().toString();
+
+        try (PreparedStatement sel = conn.prepareStatement(
+            "SELECT allowed,daily_limit_paise,daily_spent_paise,reserved_paise,last_reset_date " +
+            "FROM agent_policy WHERE agent_id=?"
+        )) {
+            sel.setString(1, agentId);
+            try (ResultSet rs = sel.executeQuery()) {
+                if (!rs.next()) return new PolicyResult(false, "Agent not found.");
+                if (rs.getInt("allowed") == 0) return new PolicyResult(false, "Agent blocked.");
+
+                long limit    = rs.getLong("daily_limit_paise");
+                long spent    = rs.getLong("daily_spent_paise");
+                String last   = rs.getString("last_reset_date");
+
+                if (!today.equals(last)) spent = 0;
+
+                if (spent + amountPaise > limit) {
+                    return new PolicyResult(false,
+                        String.format("Daily cap: spent=%d limit=%d requested=%d paise",
+                            spent, limit, amountPaise));
+                }
+
+                long newSpent = spent + amountPaise;
+                try (PreparedStatement upd = conn.prepareStatement(
+                    "UPDATE agent_policy SET daily_spent_paise=?,last_reset_date=? WHERE agent_id=?"
+                )) {
+                    upd.setLong(1, newSpent);
+                    upd.setString(2, today);
+                    upd.setString(3, agentId);
+                    upd.executeUpdate();
+                }
+                return new PolicyResult(true,
+                    String.format("OK. Spent today: %d/%d paise", newSpent, limit));
+            }
+        }
+    }
+
     public static PolicyResult checkAndDebit(String agentId, long amountPaise) {
         if (amountPaise < 0) return new PolicyResult(false, "Amount cannot be negative.");
         try (Connection conn = AgentDatabase.getConnection()) {
             conn.setAutoCommit(false);
             beginImmediate(conn);
             try {
-                AgentDatabase.insertDefaultPolicy(conn, agentId);
-                String today = LocalDate.now().toString();
-
-                try (PreparedStatement sel = conn.prepareStatement(
-                    "SELECT allowed,daily_limit_paise,daily_spent_paise,reserved_paise,last_reset_date " +
-                    "FROM agent_policy WHERE agent_id=?"
-                )) {
-                    sel.setString(1, agentId);
-                    try (ResultSet rs = sel.executeQuery()) {
-                        if (!rs.next()) { conn.rollback(); return new PolicyResult(false, "Agent not found."); }
-
-                        if (rs.getInt("allowed") == 0) { conn.rollback(); return new PolicyResult(false, "Agent blocked."); }
-
-                        long limit    = rs.getLong("daily_limit_paise");
-                        long spent    = rs.getLong("daily_spent_paise");
-                        long reserved = rs.getLong("reserved_paise");
-                        String last   = rs.getString("last_reset_date");
-
-                        if (!today.equals(last)) spent = 0;
-
-                        // For metering, check against limit only (no reservation involved).
-                        if (spent + amountPaise > limit) {
-                            conn.rollback();
-                            return new PolicyResult(false,
-                                String.format("Daily cap: spent=%d limit=%d requested=%d paise",
-                                    spent, limit, amountPaise));
-                        }
-
-                        long newSpent = spent + amountPaise;
-                        try (PreparedStatement upd = conn.prepareStatement(
-                            "UPDATE agent_policy SET daily_spent_paise=?,last_reset_date=? WHERE agent_id=?"
-                        )) {
-                            upd.setLong(1, newSpent);
-                            upd.setString(2, today);
-                            upd.setString(3, agentId);
-                            upd.executeUpdate();
-                        }
-                        conn.commit();
-                        return new PolicyResult(true,
-                            String.format("OK. Spent today: %d/%d paise", newSpent, limit));
-                    }
+                PolicyResult res = checkAndDebit(conn, agentId, amountPaise);
+                if (res.allowed) {
+                    conn.commit();
+                } else {
+                    conn.rollback();
                 }
+                return res;
             } catch (SQLException e) {
                 rollback(conn); return new PolicyResult(false, "Policy error: " + e.getMessage());
             }

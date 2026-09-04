@@ -101,11 +101,17 @@ public class AgentDatabase {
             st.execute(
                 "CREATE TABLE IF NOT EXISTS payment_event (" +
                 "  id          INTEGER PRIMARY KEY AUTOINCREMENT," +
+                "  event_id    TEXT," +
                 "  event_type  TEXT NOT NULL," +
                 "  payment_id  TEXT NOT NULL," +
                 "  order_id    TEXT," +
                 "  received_at TEXT NOT NULL DEFAULT (datetime('now'))" +
                 ")"
+            );
+
+            st.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_event_id " +
+                "ON payment_event(event_id) WHERE event_id IS NOT NULL"
             );
 
             st.execute(
@@ -126,6 +132,7 @@ public class AgentDatabase {
 
             // Schema upgrade for existing DBs.
             addColumnIfMissing(st, "agent_policy", "reserved_paise", "BIGINT NOT NULL DEFAULT 0");
+            addColumnIfMissing(st, "payment_event", "event_id", "TEXT");
 
             System.out.println("[AgentDatabase] schema ready");
 
@@ -164,78 +171,108 @@ public class AgentDatabase {
     }
 
     /*
-     * Fix #3 (reservation expiry): release budget held by abandoned 402 orders.
-     * Called at the start of issueChallenge so stale holds don't permanently eat
-     * into an agent's daily cap.
-     *
-     * Any PENDING challenge older than CHALLENGE_EXPIRY_MINUTES is marked EXPIRED
-     * and its reserved amount is released back to the agent's pool.
+     * Fix #3 (atomic reservation expiry): release budget held by abandoned 402 orders.
+     * Runs inside a single BEGIN IMMEDIATE transaction so selecting expired challenges,
+     * updating their status to EXPIRED, and releasing the reserved amount happen atomically
+     * without any race with concurrent verifications.
      */
     public static void purgeExpiredChallenges(String agentId) {
         String cutoff = String.format(
             "datetime('now', '-%d minutes')", CHALLENGE_EXPIRY_MINUTES);
 
-        // Collect expired challenges with their amounts first.
-        List<long[]> expired = new ArrayList<>();
-        try (Connection conn = getConnection();
-             PreparedStatement sel = conn.prepareStatement(
-                 "SELECT order_id, amount_paise FROM payment_challenge " +
-                 "WHERE agent_id=? AND status='PENDING' AND created_at < " + cutoff
-             )) {
-            sel.setString(1, agentId);
-            try (ResultSet rs = sel.executeQuery()) {
-                while (rs.next()) expired.add(new long[]{0, rs.getLong("amount_paise")});
+        try (Connection conn = getConnection()) {
+            conn.setAutoCommit(false);
+
+            long totalRelease = 0;
+            int count = 0;
+            try (PreparedStatement sel = conn.prepareStatement(
+                "SELECT amount_paise FROM payment_challenge " +
+                "WHERE agent_id=? AND status='PENDING' AND created_at < " + cutoff
+            )) {
+                sel.setString(1, agentId);
+                try (ResultSet rs = sel.executeQuery()) {
+                    while (rs.next()) {
+                        totalRelease += rs.getLong("amount_paise");
+                        count++;
+                    }
+                }
+            }
+
+            if (count > 0) {
+                try (PreparedStatement upd = conn.prepareStatement(
+                    "UPDATE payment_challenge SET status='EXPIRED' " +
+                    "WHERE agent_id=? AND status='PENDING' AND created_at < " + cutoff
+                )) {
+                    upd.setString(1, agentId);
+                    upd.executeUpdate();
+                }
+
+                if (totalRelease > 0) {
+                    try (PreparedStatement upd = conn.prepareStatement(
+                        "UPDATE agent_policy SET reserved_paise=MAX(0,reserved_paise-?) WHERE agent_id=?"
+                    )) {
+                        upd.setLong(1, totalRelease);
+                        upd.setString(2, agentId);
+                        upd.executeUpdate();
+                    }
+                }
+            }
+
+            conn.commit();
+            if (totalRelease > 0) {
+                System.out.printf("[AgentDatabase] Expired %d challenges for %s; released %d paise%n",
+                    count, agentId, totalRelease);
             }
         } catch (SQLException e) {
-            System.err.println("[AgentDatabase] purge query failed: " + e.getMessage());
-            return;
-        }
-
-        if (expired.isEmpty()) return;
-
-        long totalRelease = 0;
-        for (long[] row : expired) totalRelease += row[1];
-
-        // Mark them EXPIRED.
-        try (Connection conn = getConnection();
-             PreparedStatement upd = conn.prepareStatement(
-                 "UPDATE payment_challenge SET status='EXPIRED' " +
-                 "WHERE agent_id=? AND status='PENDING' AND created_at < " + cutoff
-             )) {
-            upd.setString(1, agentId);
-            upd.executeUpdate();
-        } catch (SQLException e) {
-            System.err.println("[AgentDatabase] purge update failed: " + e.getMessage());
-            return;
-        }
-
-        // Release the held budget.
-        if (totalRelease > 0) {
-            AgentPolicyEngine.releaseReservation(agentId, totalRelease);
-            System.out.printf("[AgentDatabase] Expired %d challenges for %s; released %d paise%n",
-                expired.size(), agentId, totalRelease);
+            System.err.println("[AgentDatabase] purgeExpiredChallenges failed: " + e.getMessage());
         }
     }
 
     // --- webhook deduplication ---------------------------------------------
 
+    public enum WebhookRecordResult {
+        NEW,
+        DUPLICATE,
+        ERROR
+    }
+
     /*
-     * Returns true if this (eventType, paymentId) pair has already been recorded.
-     * The UNIQUE index on payment_event enforces idempotency at the DB level.
+     * Idempotently records an incoming webhook event.
+     * Distinguishes between NEW events, DUPLICATE events, and DB ERRORS
+     * so delivery failures return HTTP 500 to signal Razorpay retry.
      */
-    public static boolean recordWebhookEvent(String eventType, String paymentId, String orderId) {
+    public static WebhookRecordResult recordWebhookEvent(String eventId, String eventType, String paymentId, String orderId) {
+        boolean hasEventId = eventId != null && !eventId.trim().isEmpty();
+        String sql = hasEventId
+            ? "INSERT INTO payment_event(event_id,event_type,payment_id,order_id) VALUES(?,?,?,?)"
+            : "INSERT INTO payment_event(event_type,payment_id,order_id) VALUES(?,?,?)";
+
         try (Connection conn = getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                 "INSERT OR IGNORE INTO payment_event(event_type,payment_id,order_id) VALUES(?,?,?)"
-             )) {
-            ps.setString(1, eventType);
-            ps.setString(2, paymentId);
-            ps.setString(3, orderId);
-            return ps.executeUpdate() == 1; // true = new event; false = duplicate
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            if (hasEventId) {
+                ps.setString(1, eventId.trim());
+                ps.setString(2, eventType);
+                ps.setString(3, paymentId);
+                ps.setString(4, orderId);
+            } else {
+                ps.setString(1, eventType);
+                ps.setString(2, paymentId);
+                ps.setString(3, orderId);
+            }
+            int rows = ps.executeUpdate();
+            return rows == 1 ? WebhookRecordResult.NEW : WebhookRecordResult.DUPLICATE;
         } catch (SQLException e) {
-            System.err.println("[AgentDatabase] recordWebhookEvent failed: " + e.getMessage());
-            return false; // fail-closed: treat uncertain state as duplicate
+            String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+            if (msg.contains("unique") || msg.contains("constraint")) {
+                return WebhookRecordResult.DUPLICATE;
+            }
+            System.err.println("[AgentDatabase] recordWebhookEvent DB error: " + e.getMessage());
+            return WebhookRecordResult.ERROR;
         }
+    }
+
+    public static boolean recordWebhookEvent(String eventType, String paymentId, String orderId) {
+        return recordWebhookEvent(null, eventType, paymentId, orderId) == WebhookRecordResult.NEW;
     }
 
     // -----------------------------------------------------------------------
