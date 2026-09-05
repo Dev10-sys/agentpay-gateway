@@ -37,8 +37,6 @@ public class App extends Application<AppConfiguration> {
             );
         }
 
-        System.out.println("[AgentPay] Razorpay client initialized");
-
         AgentDatabase.setDbPath(cfg.getDbPath());
         AgentDatabase.initialize();
 
