@@ -504,7 +504,7 @@ def run_agent(task: str, budget_paise: int, agent_id: str, skip_meter: bool,
             elif sc == 402:
                 log("[SETTLE]", f"Threshold reached — settlement required.", indent=1)
                 break
-            time.sleep(0.2)
+            time.sleep(0.8)
 
     # Step 4: Synthesise and report.
     section("Final Report")

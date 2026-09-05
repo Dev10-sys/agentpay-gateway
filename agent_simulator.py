@@ -259,7 +259,7 @@ def phase_4_replay_attack(proof):
         sys.exit(1)
 
 
-def phase_5_meter_flow():
+def phase_5_meter_flow(tick_delay=1.0):
     step("PHASE 5 -- Usage metering flow (micro-usage accumulation & settlement)")
 
     url     = f"{SERVER}/agent/meter/{RESOURCE_ID}/tick"
@@ -278,6 +278,8 @@ def phase_5_meter_flow():
             acc = body.get("accumulated_paise", 0)
             thr = body.get("threshold_paise", 500)
             print(f"       Tick {i+1:2d}: INR {acc/100:.2f} accumulated  (threshold INR {thr/100:.2f})")
+            if tick_delay > 0:
+                time.sleep(tick_delay)
         elif r.status_code == 402:
             if body.get("status") == "settlement_required":
                 settlement_order  = body["razorpay_order_id"]
@@ -325,6 +327,9 @@ def main():
     p.add_argument("--agent",      default="simulator-agent-001")
     p.add_argument("--resource",   default="market-data-v1")
     p.add_argument("--skip-meter", action="store_true")
+    p.add_argument("--step",       action="store_true", help="Pause for Enter between phases (ideal for recording speech)")
+    p.add_argument("--delay",      type=float, default=3.0, help="Seconds to pause between phases (default: 3.0s)")
+    p.add_argument("--tick-delay", type=float, default=0.9, help="Seconds between meter ticks (default: 0.9s)")
     args = p.parse_args()
 
     SERVER      = args.server
@@ -339,10 +344,27 @@ def main():
 
     order_id, amount_paise = phase_1_request_resource()
     proof = phase_2_pay_via_checkout(order_id, amount_paise)
+
+    if args.step:
+        input("\n[Press Enter to proceed to Phase 3: Payment Verification] ")
+    elif args.delay > 0:
+        time.sleep(args.delay)
+
     phase_3_retry_with_proof(proof)
+
+    if args.step:
+        input("\n[Press Enter to proceed to Phase 4: Replay Attack Defense] ")
+    elif args.delay > 0:
+        time.sleep(args.delay)
+
     phase_4_replay_attack(proof)
+
     if not args.skip_meter:
-        phase_5_meter_flow()
+        if args.step:
+            input("\n[Press Enter to proceed to Phase 5: Usage Metering Flow] ")
+        elif args.delay > 0:
+            time.sleep(args.delay)
+        phase_5_meter_flow(tick_delay=args.tick_delay)
 
     print("\n" + "="*60)
     print("  All phases completed successfully.")
