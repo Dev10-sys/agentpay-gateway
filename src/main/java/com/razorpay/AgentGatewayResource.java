@@ -253,6 +253,11 @@ public class AgentGatewayResource {
             conn.setAutoCommit(false);
             try (java.sql.Statement st = conn.createStatement()) {
                 st.execute("BEGIN IMMEDIATE");
+            } catch (SQLException e) {
+                String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+                if (!msg.contains("cannot start a transaction within a transaction")) {
+                    throw e;
+                }
             }
             try {
                 boolean consumed = AgentDatabase.atomicConsumeChallenge(conn, orderId);

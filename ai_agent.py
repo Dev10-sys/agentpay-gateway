@@ -298,7 +298,7 @@ new Razorpay({{
     key:"{KEY_ID}",amount:"{amount_paise}",currency:"INR",
     name:"AgentPay Gateway",description:"Agent access: {resource_id}",
     order_id:"{order_id}",
-    prefill:{{name:"AI Agent",email:"agent@agentpay.dev",contact:"+919999999999"}},
+    prefill:{{name:"AI Agent",email:"agent@agentpay.dev",contact:"8077907751"}},
     handler:function(r){{document.getElementById('r').textContent=JSON.stringify(r);window._done=r;}},
     modal:{{ondismiss:function(){{window._done='dismissed';}}}},
     theme:{{color:"#6366f1"}}
@@ -350,22 +350,37 @@ new Razorpay({{
                     function set(el,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,v);
                     el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}
                     for(var i of document.querySelectorAll('input')){var p=i.placeholder||'';
-                    if(p.toLowerCase().includes('mobile')||p.toLowerCase().includes('phone')){set(i,'9999999999');break;}}
-                    for(var b of document.querySelectorAll('button')) if(b.textContent.trim()==='Continue'){b.click();return;}
+                    if(p.toLowerCase().includes('mobile')||p.toLowerCase().includes('phone')){set(i,'8077907751');break;}}
+                    var btns = Array.from(document.querySelectorAll('button')).filter(b => b.textContent.trim() === 'Continue');
+                    if (btns.length > 0) btns[btns.length - 1].click();
                 }""")
                 page.wait_for_timeout(1500)
             except: pass
 
             try:
-                frame.get_by_text("Netbanking").first.click(); page.wait_for_timeout(1500)
-                frame.get_by_text("Bank of Baroda").first.click()
-                for _ in range(16):
+                frame.evaluate("""() => {
+                    var overlays = document.querySelectorAll('.stack-overlay, #overlay-backdrop, [data-testid*="overlay"]');
+                    for (var o of overlays) o.remove();
+                }""")
+            except: pass
+
+            try:
+                frame.get_by_text("Netbanking").first.click(force=True)
+                page.wait_for_timeout(1500)
+                bob = frame.get_by_text("Bank of Baroda").first
+                bob.click(force=True)
+                for _ in range(25):
                     extras = [pg for pg in ctx.pages if pg != page]
                     if extras:
                         bp = extras[0]
                         try:
-                            bp.wait_for_load_state("domcontentloaded", timeout=4000)
-                            bp.get_by_role("button", name="Success").click(timeout=4000)
+                            if "about:blank" in bp.url:
+                                page.wait_for_timeout(500)
+                                continue
+                            bp.wait_for_load_state("domcontentloaded", timeout=5000)
+                            s_btn = bp.locator('button:has-text("Success"), button[value="Success"], input[value="Success"]').first
+                            s_btn.wait_for(state="visible", timeout=5000)
+                            s_btn.click()
                             page.wait_for_timeout(2500); break
                         except: pass
                     page.wait_for_timeout(500)

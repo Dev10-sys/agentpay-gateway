@@ -388,6 +388,12 @@ public class UsageMeterResource {
 
     private void beginImmediate(Connection conn) throws SQLException {
         try (java.sql.Statement st = conn.createStatement()) { st.execute("BEGIN IMMEDIATE"); }
+        catch (SQLException e) {
+            String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+            if (!msg.contains("cannot start a transaction within a transaction")) {
+                throw e;
+            }
+        }
     }
 
     private void rollback(Connection conn) {
