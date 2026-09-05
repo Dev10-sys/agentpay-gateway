@@ -58,9 +58,9 @@ RESOURCE_CATALOG = {
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-def log(icon, msg, indent=0):
+def log(tag, msg, indent=0):
     prefix = "  " * indent
-    print(f"  {icon} {prefix}{msg}")
+    print(f"  {tag:<12} {prefix}{msg}")
 
 def section(title):
     print(f"\n{'─'*60}")
@@ -268,7 +268,7 @@ class AgentBrain:
 
     def _think(self, msg: str):
         self.reasoning_log.append(msg)
-        log("🧠", msg, indent=1)
+        log("[REASON]", msg, indent=1)
 
 # ── Tool implementations ───────────────────────────────────────────────────────
 
@@ -283,7 +283,7 @@ def tool_discover_resource(agent_id: str, resource_id: str) -> dict:
 def tool_pay_and_access(agent_id: str, resource_id: str,
                         order_id: str, amount_paise: int) -> dict:
     """Pay via Razorpay Checkout, then retry the resource request with proof headers."""
-    log("💳", f"Paying ₹{amount_paise/100:.2f} for {resource_id} via Razorpay Checkout...")
+    log("[CHECKOUT]", f"Authorizing ₹{amount_paise/100:.2f} for {resource_id} via Razorpay Checkout...")
 
     from playwright.sync_api import sync_playwright
     import threading, http.server, socket
@@ -439,59 +439,59 @@ def run_agent(task: str, budget_paise: int, agent_id: str, skip_meter: bool,
               llm_provider: str = "auto", llm_key: str = None, model: str = None):
     brain = AgentBrain(task, budget_paise, agent_id, llm_provider, llm_key, model)
 
-    section(f"AgentPay — AI Agent Starting")
-    log("🎯", f"Task   : {task}")
-    log("💰", f"Budget : ₹{budget_paise/100:.2f}")
-    log("🤖", f"Agent  : {agent_id}")
-    log("🧠", f"Engine : {brain.llm_provider.upper()} ({brain.model or 'heuristic'})")
+    section("AgentPay Client — Procurement Execution")
+    log("[TASK]", f"Task   : {task}")
+    log("[BUDGET]", f"Budget : ₹{budget_paise/100:.2f}")
+    log("[AGENT]", f"Agent  : {agent_id}")
+    log("[ENGINE]", f"Engine : {brain.llm_provider.upper()} ({brain.model or 'heuristic'})")
 
     # Step 1: Plan which resources are needed.
     section("Step 1 — Planning")
     resource_plan = brain.plan()
-    log("📋", f"Resources to query: {resource_plan}")
+    log("[PLAN]", f"Resources to query: {resource_plan}")
 
     # Step 2: For each resource — discover, decide, pay, access.
     for resource_id in resource_plan:
         section(f"Step 2 — Accessing '{resource_id}'")
 
-        log("🔍", f"Discovering resource: {resource_id}")
+        log("[DISCOVER]", f"Discovering resource: {resource_id}")
         discovery = tool_discover_resource(agent_id, resource_id)
         sc   = discovery["status_code"]
         body = discovery["body"]
 
         if sc == 200:
-            log("✅", "Resource is free — accessing directly.")
+            log("[DIRECT]", "Resource is free — accessing directly.")
             brain.record_result(resource_id, body)
             continue
 
         if sc == 402:
             order_id    = body.get("razorpay_order_id", "")
             amount      = body.get("amount_paise", 0)
-            log("💡", f"402 — payment required: ₹{amount/100:.2f} for '{resource_id}'")
+            log("[CHALLENGE]", f"HTTP 402 payment required: ₹{amount/100:.2f} for '{resource_id}'")
 
             should_pay, reason = brain.decide_to_pay(resource_id, amount)
             if not should_pay:
-                log("🚫", f"Skipping: {reason}")
+                log("[SKIP]", f"Skipping: {reason}")
                 continue
 
-            log("🛒", f"Decided to pay. Reason: {reason}")
+            log("[DECISION]", f"Decided to pay. Reason: {reason}")
             result = tool_pay_and_access(agent_id, resource_id, order_id, amount)
 
             if result.get("ok"):
                 paid = result.get("amount_paise", amount)
                 brain.spent_paise += paid
-                log("✅", f"Access granted. Spent: ₹{paid/100:.2f} | Remaining: ₹{brain.remaining_paise/100:.2f}")
+                log("[SUCCESS]", f"Access granted. Spent: ₹{paid/100:.2f} | Remaining: ₹{brain.remaining_paise/100:.2f}")
                 brain.record_result(resource_id, result.get("data", {}))
             else:
-                log("❌", f"Payment failed: {result.get('message')}")
+                log("[FAIL]", f"Payment failed: {result.get('message')}")
         else:
-            log("⚠️", f"Unexpected response: {sc}")
+            log("[WARN]", f"Unexpected response: {sc}")
 
     # Step 3 (optional): demonstrate metered usage.
     if not skip_meter and resource_plan:
         primary = resource_plan[0]
         section(f"Step 3 — Metered usage on '{primary}'")
-        log("📊", "Sending 5 usage ticks (50p each) to demonstrate metering...")
+        log("[METER]", "Sending 5 usage ticks (50p each) to demonstrate metering...")
         for i in range(5):
             tick_amount = 50
             tick_result = tool_meter_tick(agent_id, primary, tick_paise=tick_amount)
@@ -500,9 +500,9 @@ def run_agent(task: str, budget_paise: int, agent_id: str, skip_meter: bool,
             if sc == 200:
                 acc = body.get("accumulated_paise", 0)
                 brain.spent_paise += tick_amount
-                log("↗️", f"Tick {i+1}: ₹{acc/100:.2f} accumulated | Added to spend: ₹{tick_amount/100:.2f} (Total: ₹{brain.spent_paise/100:.2f})", indent=1)
+                log("[TICK]", f"Tick {i+1}: ₹{acc/100:.2f} accumulated | Added to spend: ₹{tick_amount/100:.2f} (Total: ₹{brain.spent_paise/100:.2f})", indent=1)
             elif sc == 402:
-                log("📦", f"Threshold reached — settlement required.", indent=1)
+                log("[SETTLE]", f"Threshold reached — settlement required.", indent=1)
                 break
             time.sleep(0.2)
 
@@ -514,7 +514,7 @@ def run_agent(task: str, budget_paise: int, agent_id: str, skip_meter: bool,
         print(f"    {line}")
 
     print()
-    log("✅", f"Agent task complete. Total spent: ₹{brain.spent_paise/100:.2f}")
+    log("[DONE]", f"Agent task complete. Total spent: ₹{brain.spent_paise/100:.2f}")
     print()
 
 
