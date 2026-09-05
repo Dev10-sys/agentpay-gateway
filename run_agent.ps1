@@ -1,7 +1,6 @@
 $env:PYTHONIOENCODING="utf-8"
 if (-not $env:RAZORPAY_KEY_ID) {
-    Write-Error "Set RAZORPAY_KEY_ID before running. Example: `$env:RAZORPAY_KEY_ID='rzp_test_xxx'"
-    exit 1
+    $env:RAZORPAY_KEY_ID = "rzp_test_TX90BbXSlKMqWP"
 }
 $pyExe = if (Get-Command python -ErrorAction SilentlyContinue) {
     "python"
