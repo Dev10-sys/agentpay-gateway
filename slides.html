@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgentPay Gateway — Pitch Presentation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #070709;
+      --card-bg: rgba(18, 18, 24, 0.75);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --accent: #5850ec;
+      --accent-glow: rgba(88, 80, 236, 0.25);
+      --accent-cyan: #06b6d4;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --highlight: #38bdf8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      user-select: none;
+      background-image: 
+        radial-gradient(circle at 15% 20%, rgba(88, 80, 236, 0.12) 0%, transparent 40%),
+        radial-gradient(circle at 85% 80%, rgba(6, 182, 212, 0.08) 0%, transparent 40%);
+    }
+
+    /* Top bar */
+    header {
+      padding: 24px 48px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-badge {
+      background: linear-gradient(135deg, #5850ec, #3b82f6);
+      color: #fff;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 4px 8px;
+      border-radius: 6px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .track-tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.04);
+      padding: 6px 14px;
+      border-radius: 20px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    /* Slides container */
+    main {
+      flex: 1;
+      position: relative;
+      width: 100%;
+      max-width: 1300px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px 48px;
+    }
+
+    .slide {
+      position: absolute;
+      width: 100%;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(12px) scale(0.99);
+      transition: opacity 0.35s cubic-bezier(0.16, 1, 0.3, 1), transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    .slide.active {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0) scale(1);
+    }
+
+    /* Typography */
+    .eyebrow {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      color: var(--accent-cyan);
+      margin-bottom: 16px;
+      font-weight: 600;
+    }
+
+    h1.hero-title {
+      font-size: 3.4rem;
+      font-weight: 800;
+      line-height: 1.15;
+      letter-spacing: -0.035em;
+      max-width: 1050px;
+      margin-bottom: 32px;
+      background: linear-gradient(180deg, #ffffff 40%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    /* Cards Grid (Slide 1) */
+    .market-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      width: 100%;
+      max-width: 1050px;
+      margin-bottom: 36px;
+    }
+
+    .market-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 24px;
+      text-align: left;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .market-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+    }
+
+    .market-card .tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #38bdf8;
+      margin-bottom: 10px;
+    }
+
+    .market-card h3 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+    }
+
+    .market-card p {
+      font-size: 0.9rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    /* Paradigm Shift Banner */
+    .shift-banner {
+      display: inline-flex;
+      align-items: center;
+      gap: 20px;
+      background: rgba(88, 80, 236, 0.1);
+      border: 1px solid rgba(88, 80, 236, 0.3);
+      padding: 14px 28px;
+      border-radius: 50px;
+      font-weight: 700;
+      font-size: 1.1rem;
+      letter-spacing: 0.02em;
+      box-shadow: 0 0 30px var(--accent-glow);
+    }
+
+    .shift-banner .arrow {
+      color: var(--accent-cyan);
+      font-size: 1.3rem;
+    }
+
+    .shift-banner .active-highlight {
+      color: #60a5fa;
+      text-shadow: 0 0 16px rgba(96, 165, 250, 0.4);
+    }
+
+    /* Slide 2: Business Value */
+    .pipeline-container {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      width: 100%;
+      margin: 40px 0;
+    }
+
+    .pipe-node {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      padding: 20px 28px;
+      border-radius: 14px;
+      font-weight: 700;
+      font-size: 1.05rem;
+      letter-spacing: -0.01em;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+    }
+
+    .pipe-node.highlight-node {
+      border-color: #3b82f6;
+      background: linear-gradient(180deg, rgba(59, 130, 246, 0.15), rgba(59, 130, 246, 0.05));
+      color: #93c5fd;
+      box-shadow: 0 0 30px rgba(59, 130, 246, 0.2);
+    }
+
+    .pipe-arrow {
+      color: var(--muted);
+      font-size: 1.4rem;
+      font-weight: 300;
+    }
+
+    .value-cards {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      max-width: 980px;
+      width: 100%;
+    }
+
+    .value-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 24px;
+      text-align: left;
+    }
+
+    .value-card h4 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: #fff;
+    }
+
+    .value-card p {
+      font-size: 0.9rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    /* Slide 3: Architecture Diagram */
+    .arch-diagram {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 18px;
+      width: 100%;
+      max-width: 820px;
+      margin-top: 10px;
+    }
+
+    .arch-box {
+      width: 100%;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 18px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      backdrop-filter: blur(12px);
+    }
+
+    .arch-box.gateway {
+      border-color: rgba(99, 102, 241, 0.4);
+      background: linear-gradient(180deg, rgba(99, 102, 241, 0.12), rgba(99, 102, 241, 0.03));
+      box-shadow: 0 0 40px rgba(99, 102, 241, 0.15);
+    }
+
+    .arch-box .label {
+      font-weight: 700;
+      font-size: 1.15rem;
+    }
+
+    .arch-box .sub {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    .arch-connector {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      color: var(--muted);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+    }
+
+    /* Slide 4: Ending */
+    .end-flow {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.03);
+      padding: 16px 32px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      margin: 32px 0 24px 0;
+    }
+
+    .end-flow span.arr {
+      color: var(--accent-cyan);
+    }
+
+    /* Footer Controls */
+    footer {
+      padding: 20px 48px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .slide-dots {
+      display: flex;
+      gap: 8px;
+    }
+
+    .dot {
+      width: 32px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 2px;
+      cursor: pointer;
+      transition: all 0.25s ease;
+    }
+
+    .dot.active {
+      background: #5850ec;
+      width: 48px;
+    }
+
+    .nav-hint {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <span>AgentPay Gateway</span>
+      <span class="brand-badge">Razorpay Rails</span>
+    </div>
+    <div class="track-tag">
+      Razorpay AI Buildathon 2026 — Track 1: AI Growth & Agentic Commerce
+    </div>
+  </header>
+
+  <main>
+
+    <!-- SLIDE 1 (0:00 - 0:35): Market & Paradigm Shift -->
+    <div class="slide active" id="slide-1">
+      <div class="eyebrow">The Emerging Agentic Economy</div>
+      <h1 class="hero-title">THE INTERNET IS LEARNING TO TAKE PAYMENTS FROM AI AGENTS</h1>
+
+      <div class="market-grid">
+        <div class="market-card">
+          <div class="tag">Coinbase</div>
+          <h3>x402 Protocol</h3>
+          <p>Pay-per-request API payments for autonomous agents on crypto/USDC rails.</p>
+        </div>
+        <div class="market-card">
+          <div class="tag">Cloudflare</div>
+          <h3>Monetization Gateway</h3>
+          <p>Charging autonomous software for APIs, datasets, and MCP tool access.</p>
+        </div>
+        <div class="market-card">
+          <div class="tag">Stripe</div>
+          <h3>Machine Payments</h3>
+          <p>Protocol specifications for agent-to-business and agent-to-agent transactions.</p>
+        </div>
+      </div>
+
+      <div class="shift-banner">
+        <span>PRODUCT COMMERCE</span>
+        <span class="arrow">→</span>
+        <span class="active-highlight">MACHINE-TO-API COMMERCE</span>
+      </div>
+    </div>
+
+    <!-- SLIDE 2 (0:35 - 0:55): Razorpay Business Value -->
+    <div class="slide" id="slide-2">
+      <div class="eyebrow">Razorpay Strategic Value</div>
+      <h1 class="hero-title">TURNING API ACCESS INTO A PAYMENT OPPORTUNITY</h1>
+
+      <div class="pipeline-container">
+        <div class="pipe-node">AI Agent</div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node">API / Data / Tool</div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node">Payment Layer</div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node highlight-node">Razorpay Rails</div>
+      </div>
+
+      <div class="value-cards">
+        <div class="value-card">
+          <h4>1. Direct Pay-per-Call</h4>
+          <p>Immediate x402-inspired HTTP 402 challenge, atomic policy reservation, and cryptographic unlock via HMAC signature.</p>
+        </div>
+        <div class="value-card">
+          <h4>2. Usage Metering Aggregator</h4>
+          <p>High-frequency 50-paise micro-ticks accumulated in SQLite ledger and settled as a single consolidated ₹5.00 Razorpay order.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- SLIDE 3 (0:55 - 1:10): Architecture Diagram -->
+    <div class="slide" id="slide-3">
+      <div class="eyebrow">End-to-End M2M Architecture</div>
+      <h1 class="hero-title">HOW AGENTPAY OPERATES</h1>
+
+      <div class="arch-diagram">
+        <div class="arch-box">
+          <span class="label">🤖 Autonomous AI Agent</span>
+          <span class="sub">Evaluates Price vs Value · Requests Data · Automates Checkout</span>
+        </div>
+
+        <div class="arch-connector">
+          <span>↓ GET /agent/resource (without proof) → HTTP 402 + Razorpay Order</span>
+          <span>↑ GET /agent/resource (with payment proof) → HTTP 200 + Unlocked Data</span>
+        </div>
+
+        <div class="arch-box gateway">
+          <div>
+            <div class="label" style="color:#a5b4fc">⚡ AgentPay Gateway</div>
+            <div class="sub" style="margin-top:4px">Reserve-Before-Charge · Replay Protection · SQLite Ledger</div>
+          </div>
+          <span class="sub" style="color:#818cf8; font-weight:600">Deterministic Security Layer</span>
+        </div>
+
+        <div class="arch-connector">
+          <span>↓ Orders.create() · Payments.fetch() · HMAC-SHA256 Verification</span>
+        </div>
+
+        <div class="arch-box">
+          <span class="label">💳 Razorpay Infrastructure</span>
+          <span class="sub">INR Rails · Test Mode Checkout · Orders API · Bank Webhooks</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- SLIDE 4 (4:50 - 5:00): Final Conclusion -->
+    <div class="slide" id="slide-4">
+      <div class="eyebrow">Conclusion</div>
+      <h1 class="hero-title" style="font-size:3rem">RAZORPAY IS THE PAYMENT RAIL.<br><span style="color:#818cf8">AGENTPAY MAKES IT MACHINE-ACCESSIBLE.</span></h1>
+
+      <div class="end-flow">
+        <span>AI AGENT</span>
+        <span class="arr">→</span>
+        <span>HTTP 402</span>
+        <span class="arr">→</span>
+        <span>RAZORPAY</span>
+        <span class="arr">→</span>
+        <span>VERIFIED PAYMENT</span>
+        <span class="arr">→</span>
+        <span>PROTECTED API</span>
+      </div>
+
+      <p style="color:var(--muted); max-width:700px; font-size:1.05rem; line-height:1.6; margin-top:8px">
+        Machine-to-API payments in Indian Rupee subunits with atomic spending policies, replay rejection, and usage aggregation.
+      </p>
+    </div>
+
+  </main>
+
+  <footer>
+    <div class="slide-dots">
+      <div class="dot active" onclick="goToSlide(0)"></div>
+      <div class="dot" onclick="goToSlide(1)"></div>
+      <div class="dot" onclick="goToSlide(2)"></div>
+      <div class="dot" onclick="goToSlide(3)"></div>
+    </div>
+    <div class="nav-hint">
+      Use [←] / [→] keys or Space to switch slides
+    </div>
+  </footer>
+
+  <script>
+    let current = 0;
+    const slides = document.querySelectorAll('.slide');
+    const dots = document.querySelectorAll('.dot');
+
+    function goToSlide(idx) {
+      if (idx < 0 || idx >= slides.length) return;
+      slides[current].classList.remove('active');
+      dots[current].classList.remove('active');
+      current = idx;
+      slides[current].classList.add('active');
+      dots[current].classList.add('active');
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'Enter') {
+        goToSlide((current + 1) % slides.length);
+      } else if (e.key === 'ArrowLeft') {
+        goToSlide((current - 1 + slides.length) % slides.length);
+      }
+    });
+  </script>
+</body>
+</html>
